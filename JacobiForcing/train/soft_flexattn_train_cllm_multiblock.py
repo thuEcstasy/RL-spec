@@ -72,7 +72,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=10,
         metadata={"help": "How many (k_j, last_j) pairs to use per training step (<= 0 means use all)"},
     )
-
+    
 def rank0_print(local_rank, *args):
     if local_rank in (0, -1):
         print(*args)
@@ -155,7 +155,7 @@ def train():
 
     training_args.qlora = model_args.qlora
 
-    training_args.deepspeed = training_args.deepspeed or "scripts/ds_config_cpu_offloading.json"
+    training_args.deepspeed = training_args.deepspeed or "scripts/train/ds_config_cpu_offloading.json"
 
     # Accelerate + DeepSpeed plugin
     ds_plugin = DeepSpeedPlugin(hf_ds_config=training_args.deepspeed)  # path or dict

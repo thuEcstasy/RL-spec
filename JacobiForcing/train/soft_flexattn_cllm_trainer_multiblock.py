@@ -10,6 +10,9 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from functools import lru_cache
 
+import torch.distributed as dist
+import deepspeed
+
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 class CllmTrainer(Trainer):
@@ -36,6 +39,9 @@ class CllmTrainer(Trainer):
     @staticmethod
     def _to_int(x):
         return x.item() if isinstance(x, torch.Tensor) else int(x)
+
+    def get_train_dataloader(self):
+        return self.train_dataloader
 
     def _unpack_sample(self, inputs):
         """
@@ -276,12 +282,111 @@ class CllmTrainer(Trainer):
         )
         return block_mask
 
+    @torch.no_grad()
+    def maybe_sync_rollout_model(self):
+        if not hasattr(self, "rollout_dataset"):
+            return
+
+        ds = self.rollout_dataset
+        if ds is None or getattr(ds, "rollout_model", None) is None:
+            return
+
+        every = getattr(self.args, "rollout_sync_every", 1)
+        if self.train_step_cnt % every != 0:
+            return
+
+        train_base = self.accelerator.unwrap_model(self.model)
+        rollout_model = ds.rollout_model
+        rollout_model.eval()
+
+        # detect zero stage if available
+        zero_stage = None
+        if hasattr(self.accelerator.state, "deepspeed_plugin") and self.accelerator.state.deepspeed_plugin is not None:
+            try:
+                zero_stage = self.accelerator.state.deepspeed_plugin.zero_stage
+            except Exception:
+                zero_stage = None
+
+        # ZeRO-1 / ZeRO-2: state_dict usually works
+        if zero_stage in (None, 0, 1, 2):
+            src_sd = train_base.state_dict()
+            missing, unexpected = rollout_model.load_state_dict(src_sd, strict=False)
+            if self.accelerator.is_main_process and (missing or unexpected):
+                print(f"[sync] missing={missing[:5]} unexpected={unexpected[:5]}", flush=True)
+            rollout_model.eval()
+            return
+
+        # ZeRO-3: gather one parameter at a time
+        src_named_params = dict(train_base.named_parameters())
+        dst_named_params = dict(rollout_model.named_parameters())
+
+        # sanity check on names
+        common_param_names = [n for n in src_named_params.keys() if n in dst_named_params]
+
+        for name in common_param_names:
+            src_p = src_named_params[name]
+            dst_p = dst_named_params[name]
+
+            # Gather full parameter temporarily on each rank
+            with deepspeed.zero.GatheredParameters([src_p], modifier_rank=None):
+                if src_p.data.numel() == 0:
+                    raise RuntimeError(f"[sync] gathered param still empty: {name}, shape={tuple(src_p.shape)}")
+
+                if src_p.shape != dst_p.shape:
+                    raise RuntimeError(
+                        f"[sync] shape mismatch for {name}: "
+                        f"src={tuple(src_p.shape)} dst={tuple(dst_p.shape)}"
+                    )
+
+                dst_p.data.copy_(src_p.data.to(device=dst_p.device, dtype=dst_p.dtype))
+
+        # buffers are not partitioned the same way; just copy directly
+        src_named_bufs = dict(train_base.named_buffers())
+        dst_named_bufs = dict(rollout_model.named_buffers())
+        common_buf_names = [n for n in src_named_bufs.keys() if n in dst_named_bufs]
+
+        for name in common_buf_names:
+            src_b = src_named_bufs[name]
+            dst_b = dst_named_bufs[name]
+            if src_b.shape != dst_b.shape:
+                raise RuntimeError(
+                    f"[sync] buffer shape mismatch for {name}: "
+                    f"src={tuple(src_b.shape)} dst={tuple(dst_b.shape)}"
+                )
+            dst_b.data.copy_(src_b.data.to(device=dst_b.device, dtype=dst_b.dtype))
+
+        rollout_model.eval()
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         self.train_step_cnt += 1
+        
+        did_sync = False
+        if self.train_step_cnt == 1 or self.train_step_cnt % self.args.rollout_sync_every == 0:
+            self.maybe_sync_rollout_model()
+            did_sync = True
+            
+        if did_sync and torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # log rollout tokens_per_iter
+        if "tokens_per_iter" in inputs:
+            # list to tensor
+            tpi = torch.tensor(inputs["tokens_per_iter"], dtype=torch.float, device=self.args.device)
+
+            # 多卡下先 gather，再算全局平均
+            if hasattr(self, "accelerator"):
+                tpi_all = self.accelerator.gather(tpi)
+                tpi_mean = tpi_all.mean().item()
+            else:
+                tpi_mean = tpi.mean().item()
+            if self.args.local_rank == 0:
+                wandb.log({"rollout/tokens_per_iter": tpi_mean})
+
         return self._one_pass_losses_step(model, inputs)
 
     def _one_pass_losses_step(self, model, inputs):
         input_ids, prompt_len, T = self._unpack_sample(inputs)
+        print(f"train_step_cnt={self.train_step_cnt}, prompt_len={prompt_len}, T={T}", flush=True)
         L = input_ids.size(0)
 
         eos_id = getattr(self.processing_class, "eos_token_id")
@@ -289,6 +394,10 @@ class CllmTrainer(Trainer):
         N = self.max_new_tokens
 
         expected_len = prompt_len + 2 * T * N
+        
+        # print("first block:", input_ids[prompt_len:prompt_len+N])
+        # print("second block:", input_ids[prompt_len+N:prompt_len+2*N])
+        
         if L != expected_len:
             raise ValueError(
                 f"Length mismatch: L={L}, expected {expected_len} (prompt_len={prompt_len}, T={T}, n_token_sequence_size={N})"
@@ -460,9 +569,9 @@ class CllmTrainer(Trainer):
             ar_targets = input_ids.index_select(0, t_all).clone().detach()    # [K]
             
             # ===== DEBUG PRINTING ===== #
-            if self.args.local_rank == 0:
-                print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n")
-                print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n")
+            # if self.args.local_rank == 0:
+            #     print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n", flush=True)
+            #     print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n", flush=True)
             # ===== DEBUG PRINTING ===== #
 
             ar_targets[ar_targets == pad_id] = -100  # respect ignore_index

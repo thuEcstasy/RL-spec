@@ -17,18 +17,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_parquet", type=str,
-                   default="/home/lah003/data/openai_humaneval/openai_humaneval/test-00000-of-00001.parquet")
+                   default="/home/szf/datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
     p.add_argument("--model_name", type=str,
-                   default="/home/lah003/models/Qwen2.5-Coder-7B-Instruct")
+                   default="/home/szf/huggingface/JacobiForcing_Coder_7B_v1")
     p.add_argument("--tokenizer_name", type=str,
-                   default="/home/lah003/models/Qwen2.5-Coder-7B-Instruct")
+                   default="/home/szf/huggingface/JacobiForcing_Coder_7B_v1")
     p.add_argument("--eval_dir", type=str,
-                   default="/home/lah003/data/CLLM2_eval_generations/baselines")
+                   default="/home/szf/JacobiForcing/eval/CLLM2_eval_generations/baselines")
     p.add_argument("--original_jsonl", type=str,
-                   default="/home/lah003/data/CLLM2_eval_generations/humaneval_python_example.jsonl")
+                   default="/home/szf/JacobiForcing/eval/CLLM2_eval_generations/baselines/humaneval_python_example.jsonl")
 
     # Gen settings
-    p.add_argument("--max_new_tokens", type=int, default=1024)
+    p.add_argument("--max_new_tokens", type=int, default=32768)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--do_sample", action="store_true", default=False)
@@ -183,8 +183,6 @@ def main():
                 print(f"====[{idx+1}/{len(records)}] task_id={task_id} "
                       f"new_toks={new_tokens} gen_time={gen_time:.2f}s toks/sec={toks_per_sec:.2f} "
                       f"reason={stop_reason}====")
-            
-            break
 
     t_overall = time.perf_counter() - t0_overall
 

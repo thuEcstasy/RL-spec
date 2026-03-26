@@ -1,5 +1,6 @@
 export CUDA_VISIBLE_DEVICES=2,3
 export WANDB_PROJECT=cllm2_training
+export WANDB_MODE=online
 export WANDB_API_KEY=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
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 
@@ -13,8 +14,9 @@ qlora=False
 torchrun --nnodes=1 --nproc_per_node=2 --rdzv_id=101 \
     --rdzv_endpoint='localhost:5666' \
     --master_port 10000 \
-    train/soft_flexattn_train_cllm_multiblock.py \
+    train/soft_flexattn_train_rl_spec.py \
     --target_model_path ${model_path} \
+    --rollout_model_path ${model_path} \
     --data_path ${trajectory_file} \
     --output_dir ${output_path} \
     --max_new_tokens ${n_token_seq_size} \

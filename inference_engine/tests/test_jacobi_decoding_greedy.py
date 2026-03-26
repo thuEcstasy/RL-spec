@@ -135,7 +135,7 @@ def test_single_sequence(llm: LLM, prompt: str, max_tokens: int = 1024):
     
     # Jacobi
     print("\n[Jacobi Decoding]")
-    jacobi_outputs, jacobi_time, stats = test_jacobi_decoding(llm, [prompt], max_tokens)
+    jacobi_outputs, jacobi_time, stats = (llm, [prompt], max_tokens)
     jacobi_num_tokens = len(llm.tokenizer.encode(jacobi_outputs[0]))
     jacobi_tps = jacobi_num_tokens / jacobi_time if jacobi_time > 0 else 0
     print(f"  Output: {jacobi_outputs[0]}")

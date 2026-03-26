@@ -19,11 +19,11 @@ import sys
 path_root = Path(__file__).parents[1]
 sys.path.append(str(path_root))
 
-from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved_continuous_drafting import jacobi_forward_greedy
+from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
 Qwen2ForCausalLM.jacobi_forward_greedy = jacobi_forward_greedy
 
 # Load dataset
-df = pd.read_parquet("/home/lah003/data/openai_humaneval/openai_humaneval/test-00000-of-00001.parquet")
+df = pd.read_parquet("/home/szf/datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
 df_size = len(df)
 print(f"Loaded HumanEval dataset with {df_size} samples")
 records = df.to_dict(orient="records")
@@ -31,7 +31,8 @@ records = df.to_dict(orient="records")
 # ---------------------------
 # Load model/tokenizer once
 # ---------------------------
-model_name = "/home/lah003/models/shiftedattn-10-16-7b-qwen2p5-coder-n16-distill-n32w16-data-v2-ar-1-cyclic-noise-all-1e-6/ckpt-212000"
+# model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
+model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
 
 model = Qwen2ForCausalLM.from_pretrained(
     model_name,
@@ -39,7 +40,7 @@ model = Qwen2ForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
 )
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
 model.eval()
 
 
@@ -52,7 +53,7 @@ alt_eos_id = 151645  # keep your special EOS as a fallback
 n_token_seq_len = 64
 
 # Safety caps so a sample can't run forever.
-max_new_tokens = 1024     # hard cap on total new tokens per prompt
+max_new_tokens = 32768     # hard cap on total new tokens per prompt
 max_calls = 1024          # hard cap on number of diffusion_decoding calls per prompt
 
 # ---------------------------
@@ -162,6 +163,7 @@ Please continue to complete the function. You are not allowed to modify the give
                 input_ids = torch.cat((first_correct_token.view(1,-1), q_sampled),dim=-1)
 
             t_gen_start = time.perf_counter()
+            accepted_history_ids = generated_ids[:, prompt_len:]
             past_key_values, first_correct_token, accepted_n_gram, itr_count = model.jacobi_forward_greedy(
                 input_ids=input_ids,
                 attention_mask=None,
@@ -170,6 +172,7 @@ Please continue to complete the function. You are not allowed to modify the give
                 prefill_phase=prefill_phase,
                 n_token_seq_len=n_token_seq_len,
                 tokenizer=tokenizer,
+                accepted_history_ids=accepted_history_ids,
                 eos_token_id=eos_id,
             )
             t_gen_time = time.perf_counter() - t_gen_start
@@ -246,10 +249,10 @@ def extract_python_code(text):
     else:
         return text  # Return orginal one if no match is found
 
-eval_dir = "/home/lah003/data/CLLM2_eval_generations/baselines"
+eval_dir = "/home/szf/JacobiForcing/eval/CLLM2_eval_generations/baselines"
 os.makedirs(eval_dir, exist_ok=True)
 
-original_path = os.path.join(eval_dir, 'humaneval_python_example.jsonl')
+original_path = os.path.join(eval_dir, 'humaneval_python_example_clean.jsonl')
 original_generations = load_jsonl(original_path)
 
 # Process each generation and update with processed generation
@@ -261,7 +264,7 @@ for i, original_generation in enumerate(original_generations):
     original_generation['generation'] = processed_generation
 
 # Save processed generations
-save_path = os.path.join(eval_dir, f'oct_n16w16_distilln32w16_212kstps_greedy_code_only_prompt_humaneval_w_kv_generation_{model_name.split("/")[-1]}.jsonl')
+save_path = os.path.join(eval_dir, f'{n_token_seq_len}oct_n16w16_distilln32w16_212kstps_greedy_code_only_prompt_humaneval_w_kv_generation_{model_name.split("/")[-1]}.jsonl')
 save_jsonl(original_generations, save_path)
 
 print(f"\n=== All generation done (HumanEval). Results are saved to {save_path} ===")
