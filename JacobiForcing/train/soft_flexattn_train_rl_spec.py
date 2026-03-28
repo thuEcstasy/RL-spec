@@ -58,7 +58,7 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
-    model_max_length: int = field(default=1024, metadata={"help": "Max seq length for tokenizer/model"})
+    model_max_length: int = field(default=2048, metadata={"help": "Max seq length for tokenizer/model"})
     max_new_tokens: int = field(default=64, metadata={"help": "N_BLOCK in the Jacobi trajectory"})
     report_to: str = field(default="wandb")
     use_gt_labels: bool = field(default=False)
@@ -73,7 +73,7 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
     # online jacobi sampling args
-    online_jacobi_max_new_tokens: int = field(default=256)
+    online_jacobi_max_new_tokens: int = field(default=512)
     online_jacobi_max_calls: int = field(default=128)
     online_jacobi_alt_eos_id: int = field(default=151645)
     online_jacobi_include_prompt_in_input_ids: bool = field(default=False)
@@ -288,6 +288,14 @@ def train():
         torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
         low_cpu_mem_usage=True,
     )
+    ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_args.target_model_path,
+        config=config,
+        cache_dir=training_args.cache_dir,
+        attn_implementation=attn_impl,
+        torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
+        low_cpu_mem_usage=True,
+    )
 
     if getattr(training_args, "gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
@@ -394,6 +402,7 @@ def train():
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         train_dataloader=train_dataloader,
+        ref_model=ref_model,
     )
 
     if data_args.online_jacobi_sampling:

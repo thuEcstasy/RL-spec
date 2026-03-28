@@ -11,3 +11,5 @@ ckpts
 profiling_results/*
 logs/*
 
+# checkpoints
+JacobiForcing/outputs

@@ -16,7 +16,7 @@ import deepspeed
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 class CllmTrainer(Trainer):
-    def __init__(self, *args,  accelerator=None, optimizer=None, lr_scheduler=None, train_dataloader=None, **kwargs):
+    def __init__(self, *args,  accelerator=None, optimizer=None, lr_scheduler=None, train_dataloader=None, ref_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         args = kwargs["args"]
 
@@ -26,6 +26,14 @@ class CllmTrainer(Trainer):
         self.train_dataloader = train_dataloader
 
         self.base_model = self.accelerator.unwrap_model(self.model)
+        
+        # ref model
+        self.ref_model = ref_model
+        if self.ref_model is not None:
+            self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad_(False)
+        
         self.cfg = self.base_model.config
 
         self.train_step_cnt = 0
@@ -52,14 +60,11 @@ class CllmTrainer(Trainer):
           - T: length of traj_position_indices (last uncorrupted token positions) in [1, T]
         """
         # TODO: support bsz > 1 uppacking
-        input_ids = inputs["input_ids"][0]
+        input_ids = inputs["input_ids"]
         prompt_len = inputs["prompt_ids_len"]
-        if isinstance(prompt_len, torch.Tensor):
-            if prompt_len.dim() > 0:
-                prompt_len = prompt_len[0]
         prompt_len = self._to_int(prompt_len)
 
-        traj_position_indices = inputs["traj_position_indices"][0][0]
+        traj_position_indices = inputs["traj_position_indices"][0]
         traj_position_indices = [int(u) for u in traj_position_indices]
         T = len(traj_position_indices)
 
@@ -358,6 +363,12 @@ class CllmTrainer(Trainer):
         rollout_model.eval()
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        
+        output = self.rollout_dataset._build_training_sample(inputs)
+        if output is None:
+            print(f"[dataset] skip sample idx={idx} because T=0", flush=True)
+            return -1
+        
         self.train_step_cnt += 1
         
         did_sync = False
@@ -369,9 +380,9 @@ class CllmTrainer(Trainer):
             torch.distributed.barrier()
 
         # log rollout tokens_per_iter
-        if "tokens_per_iter" in inputs:
+        if "tokens_per_iter" in output:
             # list to tensor
-            tpi = torch.tensor(inputs["tokens_per_iter"], dtype=torch.float, device=self.args.device)
+            tpi = torch.tensor(output["tokens_per_iter"], dtype=torch.float, device=self.args.device)
 
             # 多卡下先 gather，再算全局平均
             if hasattr(self, "accelerator"):
@@ -382,7 +393,7 @@ class CllmTrainer(Trainer):
             if self.args.local_rank == 0:
                 wandb.log({"rollout/tokens_per_iter": tpi_mean})
 
-        return self._one_pass_losses_step(model, inputs)
+        return self._one_pass_losses_step(model, output)
 
     def _one_pass_losses_step(self, model, inputs):
         input_ids, prompt_len, T = self._unpack_sample(inputs)
@@ -429,6 +440,10 @@ class CllmTrainer(Trainer):
 
         attn_mask = torch.ones(L, dtype=torch.long, device=input_ids.device)
         k_starts, l_starts = self._index_layout(prompt_len, T, N)
+        
+        prompt_ids_block = input_ids[:prompt_len]
+        l_blocks_concat = torch.cat([input_ids[ls:ls + N] for ls in l_starts], dim=0)
+        ar_concat_ids = torch.cat([prompt_ids_block, l_blocks_concat], dim=0)   # [L_ar] for ref model input
 
         ### METHOD 1: PAD post-EOS TOKENS on last_N
         self._flip_block_after_eos_to_pad(input_ids, l_starts[-1], N, eos_id, pad_id)
@@ -475,6 +490,14 @@ class CllmTrainer(Trainer):
             attn_implementation="flex_attention",
         )
         logits = outputs.logits
+        
+        with torch.no_grad():
+            ref_outputs = self.ref_model(
+                input_ids=ar_concat_ids.unsqueeze(0),
+                attention_mask=torch.ones_like(ar_concat_ids).unsqueeze(0),
+                use_cache=False,
+            )
+            ref_logits_full = ref_outputs.logits[0]   # [L_ar, V]
 
         # ========== AR loss ==========
         # gather (logit_pos --> target_pos) pairs
@@ -569,9 +592,9 @@ class CllmTrainer(Trainer):
             ar_targets = input_ids.index_select(0, t_all).clone().detach()    # [K]
             
             # ===== DEBUG PRINTING ===== #
-            # if self.args.local_rank == 0:
-            #     print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n", flush=True)
-            #     print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n", flush=True)
+            if self.args.local_rank == 0:
+                print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n", flush=True)
+                print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n", flush=True)
             # ===== DEBUG PRINTING ===== #
 
             ar_targets[ar_targets == pad_id] = -100  # respect ignore_index

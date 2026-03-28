@@ -6,8 +6,8 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 
 model_path="/home/szf/huggingface/Qwen2.5-Coder-3B-Instruct"
 #trajectory_file="/checkpoint/lhu/data/CLLM2_openthought/merged/merged_data_v2_8_27_opencodeinstruct.jsonl"
-trajectory_file="/mnt/szf_temp/_datasets/OpenCodeInstruct_training_data_n32w16/merged-traj-data-oct-16-n32w16.jsonl"
-output_path="/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/soft_flexattn_train_cllm_multiblock_n32w16"
+prompt_file="/mnt/szf_temp/datasets/OpenCodeInstruct/data/train-00011-of-00050.jsonl"
+output_path="/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_n32w16"
 n_token_seq_size=32
 qlora=False
 
@@ -17,7 +17,7 @@ torchrun --nnodes=1 --nproc_per_node=2 --rdzv_id=101 \
     train/soft_flexattn_train_rl_spec.py \
     --target_model_path ${model_path} \
     --rollout_model_path ${model_path} \
-    --data_path ${trajectory_file} \
+    --data_path ${prompt_file} \
     --output_dir ${output_path} \
     --max_new_tokens ${n_token_seq_size} \
     --bf16 True \
@@ -28,7 +28,7 @@ torchrun --nnodes=1 --nproc_per_node=2 --rdzv_id=101 \
     --gradient_accumulation_steps 1 \
     --gradient_checkpointing True \
     --save_strategy "steps" \
-    --save_steps 5000 \
+    --save_steps 500 \
     --save_total_limit 8 \
     --learning_rate 1e-5 \
     --weight_decay 0. \

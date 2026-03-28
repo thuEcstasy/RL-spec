@@ -12,11 +12,12 @@ import transformers
 
 from pathlib import Path
 import sys
-# 你原来推理脚本里就是这样注入 jacobi_forward_greedy 的
+\
 project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
+
 
 
 def _pad_or_truncate_block(x: torch.Tensor, target_len: int, pad_id: int) -> torch.Tensor:
@@ -149,6 +150,8 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         self.rollout_model = None
         self.rank = 0
         self.world_size = 1
+        self.global_idx = 0
+        self.noise_schedule = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
         # 给不同 epoch 做打乱用
         self.epoch = 0
@@ -292,8 +295,9 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
                 accepted_history_ids=accepted_history_ids,
                 eos_token_id=self.tokenizer.eos_token_id,
                 capture_noisy_block=True,
-                capture_len=n_token_seq_len // 2, # TODO: maybe tune this
+                capture_len=n_token_seq_len * self.noise_schedule[self.global_idx % len(self.noise_schedule)] // 16, # TODO: maybe tune this
             )
+            self.global_idx += 1
             if accepted_n_gram is None or accepted_n_gram.numel() == 0:
                 break
 
@@ -333,6 +337,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         seq_parts = [prompt_ids_2d.squeeze(0)]
 
         T = min(len(draft_blocks), len(accept_blocks))
+        print("T:", T, flush=True)
         for j in range(T):
             k_j = _pad_or_truncate_block(draft_blocks[j], N, pad_id).squeeze(0)
             l_j = _pad_or_truncate_block(accept_blocks[j], N, pad_id).squeeze(0)
@@ -364,47 +369,22 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         rank_indices = indices[self.rank::self.world_size]
         for idx in rank_indices:
             prompt_sample = self.prompt_dataset[idx]
-            sample = self._build_training_sample(prompt_sample)
-            if sample is None:
-                print(f"[dataset] skip sample idx={idx} because T=0", flush=True)
-                continue
-            sample["sample_idx"] = torch.tensor(idx, dtype=torch.long)
-            yield sample
+            # sample = self._build_training_sample(prompt_sample)
+            # if sample is None:
+            #     print(f"[dataset] skip sample idx={idx} because T=0", flush=True)
+            #     continue
+            prompt_sample["sample_idx"] = torch.tensor(idx, dtype=torch.long)
+            yield prompt_sample
 
 
 def online_jacobi_collator(features: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    简单 pad collator，兼容 batch_size > 1。
-    """
     if len(features) == 0:
-        raise ValueError("Empty batch in online_jacobi_collator")
+        raise ValueError("Empty batch")
 
-    pad_id = 0
+    f = features[0]
 
-    def pad_1d_tensors(tensors: List[torch.Tensor], pad_value: int):
-        max_len = max(t.numel() for t in tensors)
-        out = torch.full((len(tensors), max_len), pad_value, dtype=tensors[0].dtype)
-        for i, t in enumerate(tensors):
-            out[i, : t.numel()] = t
-        return out
-
-    prompt_ids = pad_1d_tensors([f["prompt_ids"] for f in features], pad_id)
-    input_ids = pad_1d_tensors([f["input_ids"] for f in features], pad_id)
-
-    # traj_position_indices shape originally [1, T]
-    trajs = [f["traj_position_indices"].squeeze(0) for f in features]
-    traj_position_indices = pad_1d_tensors(trajs, -1).unsqueeze(1)
-
-    prompt_ids_len = torch.tensor([f["prompt_ids_len"] for f in features], dtype=torch.long)
-    tokens_per_iter = torch.tensor(
-        [float(f["tokens_per_iter"]) for f in features],
-        dtype=torch.float,
-    )
     return {
-        "prompt_ids": prompt_ids,
-        "prompt_ids_len": prompt_ids_len,
-        "input_ids": input_ids,
-        "traj_position_indices": traj_position_indices,
-        "meta": [f.get("meta", {}) for f in features],
-        "tokens_per_iter": [f["tokens_per_iter"] for f in features],
+        "prompt_ids": f["prompt_ids"],
+        "prompt_ids_len": torch.tensor([f["prompt_ids_len"]], dtype=torch.long),
+        "meta": [f.get("meta", {})],
     }
