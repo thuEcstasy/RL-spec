@@ -84,7 +84,7 @@ class TrainingArguments(transformers.TrainingArguments):
     rollout_sync_every: int = field(default=1)
     rollout_device: Optional[str] = field(default=None)
     rollout_bf16: bool = field(default=True)
-
+    ref_weight: float = field(default=1.0, metadata={"help": "Weight for the ref model in the loss; 0 means no ref model"})
 
 def rank0_print(local_rank, *args):
     if local_rank in (0, -1):
@@ -210,9 +210,32 @@ def train():
     )
 
     # -------------------------
-    # load rollout model FIRST
+    # load rollout and ref model FIRST
     # no deepspeed / no accelerator / inference-only
     # -------------------------
+    
+    ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_args.target_model_path,
+        config=config,
+        cache_dir=training_args.cache_dir,
+        attn_implementation=training_args.rollout_attn_implementation,
+        torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
+        low_cpu_mem_usage=True,
+    )
+    ref_device = training_args.rollout_device
+    if ref_device is None:
+        if torch.cuda.is_available():
+            if local_rank >= 0:
+                ref_device = f"cuda:{local_rank}"
+            else:
+                ref_device = "cuda:0"
+        else:
+            ref_device = "cpu"
+
+    ref_model.to(ref_device)
+    ref_model.eval()
+    ref_model.config.use_cache = True
+    
     rollout_model = None
     if data_args.online_jacobi_sampling:
         rollout_model_path = training_args.rollout_model_path or model_args.target_model_path
@@ -288,14 +311,7 @@ def train():
         torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
         low_cpu_mem_usage=True,
     )
-    ref_model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.target_model_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
-        attn_implementation=attn_impl,
-        torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
-        low_cpu_mem_usage=True,
-    )
+
 
     if getattr(training_args, "gradient_checkpointing", False):
         model.gradient_checkpointing_enable()

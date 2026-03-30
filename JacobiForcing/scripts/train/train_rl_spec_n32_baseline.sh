@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=0,1
 export WANDB_PROJECT=RL-spec-jf
 export WANDB_MODE=online
 export WANDB_API_KEY=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
@@ -7,12 +7,12 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 model_path="/home/szf/huggingface/Qwen2.5-Coder-3B-Instruct"
 #trajectory_file="/checkpoint/lhu/data/CLLM2_openthought/merged/merged_data_v2_8_27_opencodeinstruct.jsonl"
 prompt_file="/mnt/szf_temp/datasets/OpenCodeInstruct/data/train-00011-of-00050.jsonl"
-output_path="/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_ref1_n32w16"
+output_path="/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_ref0.5_n32w16"
 n_token_seq_size=32
 qlora=False
 
 torchrun --nnodes=1 --nproc_per_node=2 --rdzv_id=101 \
-    --rdzv_endpoint='localhost:5666' \
+    --rdzv_endpoint='localhost:5667' \
     --master_port 10000 \
     train/soft_flexattn_train_rl_spec.py \
     --target_model_path ${model_path} \
@@ -36,4 +36,5 @@ torchrun --nnodes=1 --nproc_per_node=2 --rdzv_id=101 \
     --lr_scheduler_type "cosine" \
     --logging_steps 10 \
     --model_max_length 16384 \
-    --qlora ${qlora}
+    --qlora ${qlora} \
+    --ref_weight 0.5 \

@@ -405,103 +405,43 @@ class CllmTrainer(Trainer):
         N = self.max_new_tokens
 
         expected_len = prompt_len + 2 * T * N
-        
-        # print("first block:", input_ids[prompt_len:prompt_len+N])
-        # print("second block:", input_ids[prompt_len+N:prompt_len+2*N])
-        
         if L != expected_len:
             raise ValueError(
-                f"Length mismatch: L={L}, expected {expected_len} (prompt_len={prompt_len}, T={T}, n_token_sequence_size={N})"
+                f"Length mismatch: L={L}, expected {expected_len} "
+                f"(prompt_len={prompt_len}, T={T}, n_token_sequence_size={N})"
             )
-
-        # ===== Debug printing =====
-        # detok the AR input sequence
-        #prompt_ids_block = input_ids[:prompt_len]
-        #l_blocks_concat = torch.cat([input_ids[ls : ls + N] for ls in l_starts], dim=0)
-        #ar_concat_ids = torch.cat([prompt_ids_block, l_blocks_concat], dim=0)
-
-        #print("\n=== AR INPUTS (prompt + concatenated l_j blocks) ===")
-        
-        # Decode
-        #ar_text = self.processing_class.decode(ar_concat_ids, skip_special_tokens=False)
-
-        #print("\n[Decoded text]")
-        #print(ar_text)
-
-        # Print all k_j blocks separately
-        #print("\n=== k_j BLOCKS ===")
-        #for j, ks in enumerate(k_starts):
-        #    block_ids = input_ids[ks : ks + N]
-        #    block_text = self.processing_class.decode(block_ids, skip_special_tokens=False)
-        #    print(f"[k_{j}]")
-        #    print(block_text)
-        #    print()
-        # ==========================
 
         attn_mask = torch.ones(L, dtype=torch.long, device=input_ids.device)
         k_starts, l_starts = self._index_layout(prompt_len, T, N)
-        
+
+        # clean AR chain for potential ref usage / debugging: [prompt, last_0, last_1, ..., last_{T-1}]
         prompt_ids_block = input_ids[:prompt_len]
         l_blocks_concat = torch.cat([input_ids[ls:ls + N] for ls in l_starts], dim=0)
-        ar_concat_ids = torch.cat([prompt_ids_block, l_blocks_concat], dim=0)   # [L_ar] for ref model input
+        ar_concat_ids = torch.cat([prompt_ids_block, l_blocks_concat], dim=0)
 
-        ### METHOD 1: PAD post-EOS TOKENS on last_N
+        # noisy chain for ref usage: [prompt, k_0, k_1, ..., k_{T-1}]
+        k_blocks_concat = torch.cat([input_ids[ks:ks + N] for ks in k_starts], dim=0)
+        noisy_concat_ids = torch.cat([prompt_ids_block, k_blocks_concat], dim=0)
+
+        # ===== mutate post-EOS tokens in the final last block to PAD as before =====
         self._flip_block_after_eos_to_pad(input_ids, l_starts[-1], N, eos_id, pad_id)
-        
-        ###-- METHOD 2: cut post-EOS inside k_N & last_N block
-        #--for j in range(T):
-        #--    starting_pos_k = k_starts[j]
-        #--    starting_pos_l = l_starts[j]
-        
-        #--    block_k = input_ids[starting_pos_k : starting_pos_k + N]
-        #--    block_l = input_ids[starting_pos_l : starting_pos_l + N]
 
-        #--    pos = (block_l == eos_id).nonzero(as_tuple=False)
-        #--    if pos.numel():
-        #--        first_eos_pos_k = starting_pos_k + int(pos[0])
-        #--        first_eos_pos_l = starting_pos_l + int(pos[0])
-        #--        attn_mask[first_eos_pos_k + 1 : starting_pos_k + N] = 0
-        #--        attn_mask[first_eos_pos_l + 1 : starting_pos_l + N] = 0
-
-        # Build structural block mask
-        num_heads = getattr(self.cfg, 'num_attention_heads', 28)
-        #print(f"num heads from config: {self.cfg.num_attention_heads}")
-        #print(f"[block mask] num_heads={num_heads}, L={L}, prompt_len={prompt_len}, T={T}, N={N}")
+        # ===== block-structured student forward =====
+        num_heads = getattr(self.cfg, "num_attention_heads", 28)
         blk_mask = self._build_block_mask(L, prompt_len, T, num_heads)
-        # shared position ids for each (k_j, last_j) pair
         position_ids = self._build_shared_position_ids(L, prompt_len, T)
-
-        # ---- DEBUG: mask + positions sanity checks ----
-        #-if (self.args.local_rank in (-1, 0)) and self.debug_masks and (self.train_step_cnt % self.debug_every == 0):
-        #-    with torch.no_grad():
-        #-        # Invariants of your current flex pattern
-        #-        self._assert_invariants(blk_mask, prompt_len, N, T, L)
-        #-        # RoPE positions are shared within each (k_j, last_j) pair
-        #-        self._check_shared_positions(position_ids, prompt_len, T)
-                # Human-readable peek
-        #-        self._dump_visibility(blk_mask, prompt_len, N, T, L, max_rows=3)
-        # -----------------------------------------------
 
         outputs = model(
             input_ids=input_ids.unsqueeze(0),
             attention_mask=blk_mask,
-            #block_mask=blk_mask,
             position_ids=position_ids.unsqueeze(0),
             attn_implementation="flex_attention",
         )
-        logits = outputs.logits
-        
-        with torch.no_grad():
-            ref_outputs = self.ref_model(
-                input_ids=ar_concat_ids.unsqueeze(0),
-                attention_mask=torch.ones_like(ar_concat_ids).unsqueeze(0),
-                use_cache=False,
-            )
-            ref_logits_full = ref_outputs.logits[0]   # [L_ar, V]
+        logits = outputs.logits  # [1, L, V]
 
-        # ========== AR loss ==========
-        # gather (logit_pos --> target_pos) pairs
-        # run soft CE.
+        # =========================================================
+        # AR loss (原来的计算部分保留)
+        # =========================================================
         pair_logit_positions = []
         pair_target_positions = []
 
@@ -519,16 +459,15 @@ class CllmTrainer(Trainer):
         end_prompt = prompt_len
         add_forward_pairs(0, end_prompt)
 
-        # for each j, we need an effective length ('end' from j-1) to compute first-token loss in last_j
+        # for each j, compute first-token bridge + in-block AR pairs on last_j
         for j in range(T):
             ls = l_starts[j]
 
-            # first append bridging token
+            # bridge token
             if j == 0:
-                # map last token from prompt to first token in last_0
                 logit_pos = end_prompt - 1
                 target_pos = ls
-            elif j > 0:
+            else:
                 prev_ls = l_starts[j - 1]
                 logit_pos = prev_ls + (N - 1)
                 target_pos = ls
@@ -536,10 +475,8 @@ class CllmTrainer(Trainer):
             pair_logit_positions.append(torch.tensor([logit_pos], device=self.args.device))
             pair_target_positions.append(torch.tensor([target_pos], device=self.args.device))
 
-            # handle (k_j, last_j) block
-            block = input_ids[ls : ls + N]
+            block = input_ids[ls: ls + N]
 
-            # respect EOS inside the block
             eos_pos = None
             if eos_id is not None:
                 epos = torch.nonzero(block == eos_id, as_tuple=False)
@@ -548,73 +485,40 @@ class CllmTrainer(Trainer):
             end = N
             if eos_pos is not None:
                 end = min(end, eos_pos + 1)  # include EOS in segment
-                
+
                 # mark PAD as 0 for attn_mask
-                mask_block = attn_mask[ls : ls + N]
-                mask_block[block == pad_id] = 0
-                attn_mask[ls : ls + N] = mask_block
+                if pad_id is not None:
+                    mask_block = attn_mask[ls: ls + N]
+                    mask_block[block == pad_id] = 0
+                    attn_mask[ls: ls + N] = mask_block
 
-            #print(f"ending position for block {j}: {end}")
-
-            # in-block forward pairs
             add_forward_pairs(ls, ls + end)
 
-            #--if eos_pos is not None:
-            #--    break
-
-        # Bridges: (last_{j-1} last token logits) -> (first token of last_j)
-        # Note: This skips the intervening k_j block
-        #for j in range(1, T):
-            # length of the 
-        #    prev_end = last_effective_ends[j - 1]
-
-        #    prev_ls = l_starts[j - 1]
-            # last token logit from last_{j-1}
-        #    logit_pos = prev_ls + (prev_end - 1)
-            # first token target from last_j
-        #    target_pos = l_starts[j]
-
-            # edge case: skip if target is PAD
-        #    if pad_id is not None and input_ids[target_pos].item() == pad_id:
-        #        continue
-
-        #    pair_logit_positions.append(torch.tensor([logit_pos], device=self.args.device, dtype=torch.long))
-        #    pair_target_positions.append(torch.tensor([target_pos], device=self.args.device, dtype=torch.long))
-
-        # Compute CE over all pairs
+        # Compute CE over all AR pairs (保留原逻辑)
         if len(pair_logit_positions) == 0:
             loss_ar = torch.zeros((), device=self.args.device)
         else:
             p_all = torch.cat(pair_logit_positions, dim=0)
             t_all = torch.cat(pair_target_positions, dim=0)
 
-            ar_logits  = logits[0, p_all, :].clone()                          # [K, V]
-            ar_targets = input_ids.index_select(0, t_all).clone().detach()    # [K]
-            
-            # ===== DEBUG PRINTING ===== #
+            ar_logits = logits[0, p_all, :].clone()                         # [K, V]
+            ar_targets = input_ids.index_select(0, t_all).clone().detach() # [K]
+
+            # ===== DEBUG PRINTING =====
             if self.args.local_rank == 0:
-                print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n", flush=True)
-                print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n", flush=True)
-            # ===== DEBUG PRINTING ===== #
+                print(
+                    f"===== decoded last_N AR targets =====\n"
+                    f"{self.processing_class.decode(ar_targets[-64:])}\n==========\n",
+                    flush=True,
+                )
+                print(
+                    f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n",
+                    flush=True,
+                )
+            # ===== DEBUG PRINTING =====
 
-            ar_targets[ar_targets == pad_id] = -100  # respect ignore_index
-
-            max_values, max_indices = ar_logits.max(dim=-1)
-            #print(f"\ninput ids: {input_ids.tolist()}")
-
-            #print(f"\nlabels length: {len(max_values)}")
-            #print(f"\nargmax length: {len(max_indices)}")
-            #print("\nmax logits:", max_values.tolist())
-            #print("\nargmax indices:", max_indices.tolist())
-
-            #print(f"\nattention mask length: {len(attn_mask.tolist())}")
-            #print(f"\nattention mask: {attn_mask.tolist()}")
-            #print(f"block attention mask blk_mask: {blk_mask}")
-
-            #print(f"\nprompt length: {prompt_len}")
-            #print(f"\nEOS position offset: {eos_pos}")
-            #print(f"\ngeneration max logits: {max_values[prompt_len:].tolist()}")
-            #print(f"generation indices: {max_indices[prompt_len:].tolist()}")
+            if pad_id is not None:
+                ar_targets[ar_targets == pad_id] = -100
 
             loss_ar = F.cross_entropy(
                 ar_logits.float(),
@@ -624,15 +528,13 @@ class CllmTrainer(Trainer):
                 ignore_index=-100,
             ) * 10
 
-        # ========== Consistency loss ==========
+        # =========================================================
+        # Consistency loss (原逻辑保留)
+        # =========================================================
         T_soft = getattr(self.args, "distill_temperature", 1.0)
 
-        # learn to predict first token in next block (last_{j+1})  from the last token in k_j
         drop_last_offset = False
-        if drop_last_offset:
-            offs = torch.arange(N - 1, device=self.args.device)
-        else:
-            offs = torch.arange(N, device=self.args.device)
+        offs = torch.arange(N - 1 if drop_last_offset else N, device=self.args.device)
 
         student_positions, teacher_positions = [], []
         for j in range(T):
@@ -641,48 +543,130 @@ class CllmTrainer(Trainer):
                 input_ids, ks, ls, N, eos_id=eos_id, drop_last_offset=drop_last_offset
             )
             if pair_keep.any():
-                sp = ks + offs[pair_keep]
-                tp = ls + offs[pair_keep]
+                sp = ks + offs[pair_keep]   # noisy k_j positions
+                tp = ls + offs[pair_keep]   # clean last_j positions
                 student_positions.append(sp)
                 teacher_positions.append(tp)
 
         if len(student_positions) == 0:
-            loss_consistency = torch.zeros((), device=self.args.device)
+            zero = logits.sum() * 0.0
+            loss_consistency = zero
+            loss_ref = zero
         else:
             sp = torch.cat(student_positions, dim=0)  # [K]
             tp = torch.cat(teacher_positions, dim=0)  # [K]
 
-            # build global [L] padding mask: PADs and duplicate k_j prefixes
+            # global [L] padding mask: PADs and duplicate k_j prefixes
             global_pad_and_dup_mask = self._build_padding_mask_for_loss(input_ids, prompt_len, T)
-            
-            # per-pair padding mask for soft CE (True = masking out)
+
+            # per-pair padding mask (True = mask out)
             padding_mask = global_pad_and_dup_mask.index_select(0, sp)
 
-            # Build logits for all candidate pairs
-            student_logits_all = logits[0, sp, :]
+            # ---------- student noisy logits ----------
+            student_logits_all = logits[0, sp, :]   # [K, V]
+
+            # ---------- original self-distill consistency ----------
             teacher_logits_all = logits[0, tp, :].detach()
 
-            student_logits_all = student_logits_all / T_soft
-            teacher_logits_all = teacher_logits_all / T_soft
+            student_logits_temp = student_logits_all / T_soft
+            teacher_logits_temp = teacher_logits_all / T_soft
 
             loss_consistency = self.soft_cross_entropy(
-                student_logits_all.float(),
-                teacher_logits_all.float(),
+                student_logits_temp.float(),
+                teacher_logits_temp.float(),
                 padding_mask
             )
-
             loss_consistency = loss_consistency * (T_soft * T_soft) / T
 
-        total_loss = loss_ar + loss_consistency
+            # =========================================================
+            # New ref loss: KL(student noisy logits || ref logits on same noisy chain)
+            # 实现上用 kl_div(log student, prob teacher) = KL(teacher || student)
+            # =========================================================
+            if self.ref_model is not None:
+                # map original positions in k_j blocks -> positions in noisy_concat_ids
+                orig2noisy = torch.full((L,), -1, dtype=torch.long, device=input_ids.device)
+                orig2noisy[:prompt_len] = torch.arange(prompt_len, device=input_ids.device)
+
+                cursor = prompt_len
+                for ks in k_starts:
+                    orig2noisy[ks:ks + N] = torch.arange(cursor, cursor + N, device=input_ids.device)
+                    cursor += N
+
+                ref_pos = orig2noisy.index_select(0, sp)
+                if (ref_pos < 0).any():
+                    bad = (ref_pos < 0).nonzero(as_tuple=False).view(-1)[:8]
+                    raise RuntimeError(f"Found unmapped noisy positions for ref model: {bad.tolist()}")
+
+                # run ref model on noisy chain
+                with torch.no_grad():
+                    ref_param = next(self.ref_model.parameters())
+                    ref_device = ref_param.device
+
+                    ref_input_ids = noisy_concat_ids.to(ref_device).unsqueeze(0)
+                    ref_attn = torch.ones_like(noisy_concat_ids, device=ref_device).unsqueeze(0)
+
+                    ref_outputs = self.ref_model(
+                        input_ids=ref_input_ids,
+                        attention_mask=ref_attn,
+                        use_cache=False,
+                    )
+                    ref_logits_full = ref_outputs.logits[0].to(input_ids.device)   # [L_noisy, V]
+
+                ref_logits_all = ref_logits_full.index_select(0, ref_pos)   # [K, V]
+
+                valid_mask = ~padding_mask
+                tau_ref = getattr(self.args, "ref_temperature", 1.0)
+
+                if valid_mask.any():
+                    student_log_prob = F.log_softmax(
+                        student_logits_all[valid_mask].float() / tau_ref,
+                        dim=-1,
+                    )
+                    teacher_prob = F.softmax(
+                        ref_logits_all[valid_mask].float() / tau_ref,
+                        dim=-1,
+                    )
+                    loss_ref = F.kl_div(
+                        student_log_prob,
+                        teacher_prob,
+                        reduction="batchmean",
+                    ) * (tau_ref * tau_ref)
+                else:
+                    loss_ref = torch.zeros((), device=self.args.device)
+            else:
+                loss_ref = torch.zeros((), device=self.args.device)
+
+        # =========================================================
+        # Total loss switch
+        #   with ref_model: consistency + ref loss
+        #   without ref_model: consistency + ar loss
+        # =========================================================
+        if self.ref_model is not None:
+            ref_weight = getattr(self.args, "ref_weight", 1.0)
+            if ref_weight == 0.0:
+                print("[warning] ref_weight=0.0, consistency loss only", flush=True)
+                total_loss = loss_consistency
+            else:
+                print(f"[info] ref_weight={ref_weight}, combining consistency and ref losses", flush=True)
+                total_loss = loss_consistency + ref_weight * loss_ref
+        else:
+            print("[info] no ref model, using AR loss as auxiliary to consistency loss", flush=True)
+            total_loss = loss_consistency + loss_ar
 
         if self.args.qlora:
             total_loss.requires_grad = True
 
         if self.args.local_rank == 0:
-            wandb.log({"ar loss": float(loss_ar.detach().cpu()),
-                    "consistency loss": float(loss_consistency.detach().cpu())})
+            log_dict = {
+                "consistency loss": float(loss_consistency.detach().cpu()),
+                "ar loss": float(loss_ar.detach().cpu()),
+                "ref loss": float(loss_ref.detach().cpu()),
+                "total loss": float(total_loss.detach().cpu()),
+            }
+            if self.ref_model is not None:
+                log_dict["ref loss"] = float(loss_ref.detach().cpu())
+            wandb.log(log_dict)
 
-        #del outputs, logits
         torch.cuda.empty_cache()
 
         with self.accelerator.accumulate(model):
