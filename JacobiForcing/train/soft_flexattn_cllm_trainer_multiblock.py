@@ -366,8 +366,8 @@ class CllmTrainer(Trainer):
         
         output = self.rollout_dataset._build_training_sample(inputs)
         if output is None:
-            print(f"[dataset] skip sample idx={idx} because T=0", flush=True)
-            return -1
+            print(f"[dataset] skip sample idx because T=0", flush=True)
+            return torch.zeros((), device=self.args.device)
         
         self.train_step_cnt += 1
         
