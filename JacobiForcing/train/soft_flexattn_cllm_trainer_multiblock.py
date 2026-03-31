@@ -363,12 +363,17 @@ class CllmTrainer(Trainer):
         rollout_model.eval()
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # [B, L]
+        bsz = inputs["prompt_ids"].size(0)
+        losses = []
         
-        output = self.rollout_dataset._build_training_sample(inputs)
-        if output is None:
-            print(f"[dataset] skip sample idx because T=0", flush=True)
-            return torch.zeros((), device=self.args.device)
-        
+        for bidx in range(bsz):
+            output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
+            if output is None:
+                print(f"[dataset] skip sample idx because T=0", flush=True)
+                return torch.zeros((), device=self.args.device)
+            losses.append(self._one_pass_losses_step(model, output))
+
         self.train_step_cnt += 1
         
         did_sync = False
@@ -393,7 +398,7 @@ class CllmTrainer(Trainer):
             if self.args.local_rank == 0:
                 wandb.log({"rollout/tokens_per_iter": tpi_mean})
 
-        return self._one_pass_losses_step(model, output)
+        return torch.stack(losses).mean()
 
     def _one_pass_losses_step(self, model, inputs):
         input_ids, prompt_len, T = self._unpack_sample(inputs)

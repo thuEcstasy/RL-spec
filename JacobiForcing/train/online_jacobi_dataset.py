@@ -322,7 +322,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
 
     def _build_training_sample(self, prompt_sample: Dict[str, Any]) -> Dict[str, Any]:
-        rollout = self._rollout_one(prompt_sample["prompt_ids"])
+        rollout = self._rollout_one(prompt_sample)
 
         prompt_ids_2d = rollout["prompt_ids"]          # [1, P]
         prompt_len = rollout["prompt_ids_len"]
@@ -376,15 +376,3 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
             prompt_sample["sample_idx"] = torch.tensor(idx, dtype=torch.long)
             yield prompt_sample
 
-
-def online_jacobi_collator(features: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(features) == 0:
-        raise ValueError("Empty batch")
-
-    f = features[0]
-
-    return {
-        "prompt_ids": f["prompt_ids"],
-        "prompt_ids_len": torch.tensor([f["prompt_ids_len"]], dtype=torch.long),
-        "meta": [f.get("meta", {})],
-    }

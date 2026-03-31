@@ -28,8 +28,8 @@ from online_jacobi_dataset import (
     PromptOnlyDataset,
     OnlineJacobiTrajectoryDataset,
     OnlineJacobiConfig,
-    online_jacobi_collator,
 )
+from custom_collator import CustomCollator, PromptOnlyCollator
 
 logger = logging.getLogger(__name__)
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
@@ -355,7 +355,7 @@ def train():
             num_workers=0,
             pin_memory=True,
             drop_last=False,
-            collate_fn=online_jacobi_collator,
+            collate_fn=PromptOnlyCollator(tokenizer),
         )
     else:
         data_module = make_jacobian_data_module(
