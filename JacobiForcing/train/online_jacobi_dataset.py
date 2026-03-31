@@ -97,6 +97,7 @@ class PromptOnlyDataset(torch.utils.data.Dataset):
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            
             prompt_ids = self._encode_from_text(text)
             return {
                 "prompt_ids": prompt_ids,
@@ -115,7 +116,17 @@ class PromptOnlyDataset(torch.utils.data.Dataset):
             raise KeyError(
                 "PromptOnlyDataset expects one of: prompt_ids / messages / prompt / text / input"
             )
-
+        print("Original prompt text =", prompt_text, flush=True)
+        prompt_text = self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+                {"role": "user", "content": prompt_text}
+            ],
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        print("After applying chat template, prompt_text =", prompt_text, flush=True)
         prompt_ids = self._encode_from_text(prompt_text)
         return {
             "prompt_ids": prompt_ids,
