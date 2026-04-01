@@ -368,10 +368,8 @@ class CllmTrainer(Trainer):
         losses = []
         
         for bidx in range(bsz):
-            output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
-            if output is None:
-                # print(f"[dataset] skip sample idx because T=0", flush=True)
-                return torch.zeros((), device=self.args.device)
+            while output is None:
+                output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
             losses.append(self._one_pass_losses_step(model, output))
 
         self.train_step_cnt += 1
