@@ -35,6 +35,7 @@ class OnlineJacobiConfig:
     max_new_tokens: int = 512
     max_calls: int = 128
     alt_eos_id: Optional[int] = 151645
+    block_size: int = 32
     random_init_from_prompt: bool = True
 
     # 这个开关很关键：
@@ -160,7 +161,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         self.rank = 0
         self.world_size = 1
         self.global_idx = 0
-        self.noise_schedule = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4] # TODO: maybe tune this
+        self.noise_schedule = [24, 20, 16, 12, 8] # TODO: maybe tune this
 
         # 给不同 epoch 做打乱用
         self.epoch = 0
@@ -220,7 +221,6 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
     @torch.no_grad()
     def _rollout_one(self, prompt_ids_1d: torch.Tensor) -> Dict[str, Any]:
-        print("start rollout...!!!!!", flush=True)
         model = self._get_generation_model()
         model.eval()
 
@@ -293,6 +293,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
                 step_input_ids = torch.cat((first_correct_token.view(1, -1), random_tail), dim=-1)
 
             accepted_history_ids = generated_ids[:, prompt_len:]
+
             past_key_values, first_correct_token, accepted_n_gram, itr, noisy_block_record = model.jacobi_forward_greedy(
                 input_ids=step_input_ids,
                 attention_mask=None,
@@ -304,7 +305,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
                 accepted_history_ids=accepted_history_ids,
                 eos_token_id=self.tokenizer.eos_token_id,
                 capture_noisy_block=True,
-                capture_len=n_token_seq_len * self.noise_schedule[self.global_idx % len(self.noise_schedule)] // 16, # TODO: maybe tune this
+                capture_len=n_token_seq_len * self.noise_schedule[self.global_idx % len(self.noise_schedule)] // self.cfg.block_size, # TODO: maybe tune this
             )
             self.global_idx += 1
             if accepted_n_gram is None or accepted_n_gram.numel() == 0:
@@ -346,7 +347,6 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         seq_parts = [prompt_ids_2d.squeeze(0)]
 
         T = min(len(draft_blocks), len(accept_blocks))
-        print("T:", T, flush=True)
         for j in range(T):
             k_j = _pad_or_truncate_block(draft_blocks[j], N, pad_id).squeeze(0)
             l_j = _pad_or_truncate_block(accept_blocks[j], N, pad_id).squeeze(0)

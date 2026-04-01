@@ -384,25 +384,30 @@ class CllmTrainer(Trainer):
         if did_sync and torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        # log rollout tokens_per_iter
-        if "tokens_per_iter" in output:
-            # list to tensor
-            tpi = torch.tensor(output["tokens_per_iter"], dtype=torch.float, device=self.args.device)
-
-            # 多卡下先 gather，再算全局平均
-            if hasattr(self, "accelerator"):
-                tpi_all = self.accelerator.gather(tpi)
-                tpi_mean = tpi_all.mean().item()
+        if output is not None and "tokens_per_iter" in output:
+            tpi_list = output["tokens_per_iter"]
+            if len(tpi_list) > 0:
+                tpi_mean_local = torch.tensor(
+                    [sum(tpi_list) / len(tpi_list)],
+                    dtype=torch.float,
+                    device=self.args.device,
+                )
             else:
-                tpi_mean = tpi.mean().item()
-            if self.args.local_rank == 0:
-                wandb.log({"rollout/tokens_per_iter": tpi_mean})
+                tpi_mean_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
+        else:
+            tpi_mean_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
+
+        if hasattr(self, "accelerator"):
+            tpi_mean_all = self.accelerator.gather(tpi_mean_local)
+            tpi_mean = tpi_mean_all.mean().item()
+        else:
+            tpi_mean = tpi_mean_local.item()
 
         return torch.stack(losses).mean()
 
     def _one_pass_losses_step(self, model, inputs):
         input_ids, prompt_len, T = self._unpack_sample(inputs)
-        print(f"train_step_cnt={self.train_step_cnt}, prompt_len={prompt_len}, T={T}", flush=True)
+        print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
         L = input_ids.size(0)
 
         eos_id = getattr(self.processing_class, "eos_token_id")
@@ -435,6 +440,7 @@ class CllmTrainer(Trainer):
         num_heads = getattr(self.cfg, "num_attention_heads", 28)
         blk_mask = self._build_block_mask(L, prompt_len, T, num_heads)
         position_ids = self._build_shared_position_ids(L, prompt_len, T)
+
 
         outputs = model(
             input_ids=input_ids.unsqueeze(0),
@@ -525,6 +531,7 @@ class CllmTrainer(Trainer):
             if pad_id is not None:
                 ar_targets[ar_targets == pad_id] = -100
 
+
             loss_ar = F.cross_entropy(
                 ar_logits.float(),
                 ar_targets,
@@ -553,6 +560,7 @@ class CllmTrainer(Trainer):
                 student_positions.append(sp)
                 teacher_positions.append(tp)
 
+
         if len(student_positions) == 0:
             zero = logits.sum() * 0.0
             loss_consistency = zero
@@ -575,6 +583,22 @@ class CllmTrainer(Trainer):
 
             student_logits_temp = student_logits_all / T_soft
             teacher_logits_temp = teacher_logits_all / T_soft
+
+            # [DEBUG] print some of their probs to check for collapse
+            if self.args.local_rank == 0:
+                with torch.no_grad():
+                    print(
+                        f"===== sample teacher probs for first 5 pairs =====\n"
+                        f"{teacher_logits_temp[:16][:100]}\n==========\n",
+                        flush=True,
+                    )
+                    print(
+                        f"===== sample student probs for first 5 pairs =====\n"
+                        f"{student_logits_temp[:16][:100]}\n==========\n",
+                        flush=True,
+                    )
+                    print(logits[0, prompt_len + 1, :10])
+                    print(logits[0, prompt_len + N + 1, :10])
 
             loss_consistency = self.soft_cross_entropy(
                 student_logits_temp.float(),
