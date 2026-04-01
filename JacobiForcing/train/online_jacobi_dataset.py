@@ -116,7 +116,6 @@ class PromptOnlyDataset(torch.utils.data.Dataset):
             raise KeyError(
                 "PromptOnlyDataset expects one of: prompt_ids / messages / prompt / text / input"
             )
-        print("Original prompt text =", prompt_text, flush=True)
         prompt_text = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
@@ -126,7 +125,6 @@ class PromptOnlyDataset(torch.utils.data.Dataset):
             add_generation_prompt=True
         )
         
-        print("After applying chat template, prompt_text =", prompt_text, flush=True)
         prompt_ids = self._encode_from_text(prompt_text)
         return {
             "prompt_ids": prompt_ids,
@@ -162,7 +160,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         self.rank = 0
         self.world_size = 1
         self.global_idx = 0
-        self.noise_schedule = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        self.noise_schedule = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4] # TODO: maybe tune this
 
         # 给不同 epoch 做打乱用
         self.epoch = 0
