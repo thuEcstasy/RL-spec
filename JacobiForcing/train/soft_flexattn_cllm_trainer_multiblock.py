@@ -370,7 +370,7 @@ class CllmTrainer(Trainer):
         for bidx in range(bsz):
             output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
             if output is None:
-                print(f"[dataset] skip sample idx because T=0", flush=True)
+                # print(f"[dataset] skip sample idx because T=0", flush=True)
                 return torch.zeros((), device=self.args.device)
             losses.append(self._one_pass_losses_step(model, output))
 
@@ -403,7 +403,7 @@ class CllmTrainer(Trainer):
 
     def _one_pass_losses_step(self, model, inputs):
         input_ids, prompt_len, T = self._unpack_sample(inputs)
-        print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
+        # print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
         L = input_ids.size(0)
 
         eos_id = getattr(self.processing_class, "eos_token_id")
@@ -581,20 +581,20 @@ class CllmTrainer(Trainer):
             teacher_logits_temp = teacher_logits_all / T_soft
 
             # [DEBUG] print some of their probs to check for collapse
-            if self.args.local_rank == 0:
-                with torch.no_grad():
-                    print(
-                        f"===== sample teacher probs for first 5 pairs =====\n"
-                        f"{teacher_logits_temp[:16][:100]}\n==========\n",
-                        flush=True,
-                    )
-                    print(
-                        f"===== sample student probs for first 5 pairs =====\n"
-                        f"{student_logits_temp[:16][:100]}\n==========\n",
-                        flush=True,
-                    )
-                    print(logits[0, prompt_len + 1, :10])
-                    print(logits[0, prompt_len + N + 1, :10])
+            # if self.args.local_rank == 0:
+            #     with torch.no_grad():
+            #         print(
+            #             f"===== sample teacher probs for first 5 pairs =====\n"
+            #             f"{teacher_logits_temp[:16][:100]}\n==========\n",
+            #             flush=True,
+            #         )
+            #         print(
+            #             f"===== sample student probs for first 5 pairs =====\n"
+            #             f"{student_logits_temp[:16][:100]}\n==========\n",
+            #             flush=True,
+            #         )
+            #         print(logits[0, prompt_len + 1, :10])
+            #         print(logits[0, prompt_len + N + 1, :10])
 
             loss_consistency = self.soft_cross_entropy(
                 student_logits_temp.float(),
