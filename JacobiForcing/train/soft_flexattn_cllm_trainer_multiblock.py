@@ -385,7 +385,11 @@ class CllmTrainer(Trainer):
             torch.distributed.barrier()
 
         if output is not None and "tokens_per_iter" in output:
-            tpi_local = output["tokens_per_iter"]
+            tpi_local = torch.tensor(
+                [output["tokens_per_iter"]],
+                dtype=torch.float,
+                device=self.args.device,
+            )
         else:
             tpi_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
 
