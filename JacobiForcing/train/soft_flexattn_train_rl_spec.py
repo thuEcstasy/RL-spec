@@ -84,7 +84,7 @@ class TrainingArguments(transformers.TrainingArguments):
     rollout_sync_every: int = field(default=1)
     rollout_device: Optional[str] = field(default=None)
     rollout_bf16: bool = field(default=True)
-    ref_weight: float = field(default=1.0, metadata={"help": "Weight for the ref model in the loss; 0 means no ref model"})
+    ref_weight: float = field(default=10.0, metadata={"help": "Weight for the ref model in the loss; 0 means no ref model"})
 
 def rank0_print(local_rank, *args):
     if local_rank in (0, -1):
