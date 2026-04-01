@@ -412,6 +412,32 @@ class CllmTrainer(Trainer):
     def _one_pass_losses_step(self, model, inputs):
         
         input_ids, prompt_len, T = self._unpack_sample(inputs)
+        # for corner case of T=0, we still want to run a forward pass to avoid deadlocking on sync later
+        if T == 0:
+            outputs = model(
+                input_ids=input_ids.unsqueeze(0),
+                attention_mask=torch.ones_like(input_ids).unsqueeze(0),
+                position_ids=torch.arange(input_ids.size(0), device=input_ids.device).unsqueeze(0),
+            )
+            logits = outputs.logits
+            total_loss = logits.sum() * 0.
+            
+            torch.cuda.empty_cache()
+            
+            with self.accelerator.accumulate(model):
+                self.accelerator.backward(total_loss)
+            if self.args.local_rank == 0:
+                log_dict = {
+                    "consistency loss": 0.0,
+                    "ar loss": 0.0,
+                    "ref loss": 0.0,
+                    "total loss": 0.0,
+                }
+                if self.ref_model is not None:
+                    log_dict["ref loss"] = 0.0
+                wandb.log(log_dict)
+            return total_loss.detach()
+            
         # print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
         L = input_ids.size(0)
 
