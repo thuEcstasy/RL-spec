@@ -657,13 +657,13 @@ class CllmTrainer(Trainer):
                     bad = (ref_pos < 0).nonzero(as_tuple=False).view(-1)[:8]
                     raise RuntimeError(f"Found unmapped noisy positions for ref model: {bad.tolist()}")
 
-                # run ref model on noisy chain
+                # run ref model on clean chain
                 with torch.no_grad():
                     ref_param = next(self.ref_model.parameters())
                     ref_device = ref_param.device
 
-                    ref_input_ids = noisy_concat_ids.to(ref_device).unsqueeze(0)
-                    ref_attn = torch.ones_like(noisy_concat_ids, device=ref_device).unsqueeze(0)
+                    ref_input_ids = ar_concat_ids.to(ref_device).unsqueeze(0)
+                    ref_attn = torch.ones_like(ar_concat_ids, device=ref_device).unsqueeze(0)
 
                     ref_outputs = self.ref_model(
                         input_ids=ref_input_ids,
@@ -682,15 +682,21 @@ class CllmTrainer(Trainer):
                         student_logits_all[valid_mask].float() / tau_ref,
                         dim=-1,
                     )
-                    teacher_prob = F.softmax(
-                        ref_logits_all[valid_mask].float() / tau_ref,
-                        dim=-1,
+                    # teacher_prob = F.softmax(
+                    #     ref_logits_all[valid_mask].float() / tau_ref,
+                    #     dim=-1,
+                    # )
+                    # loss_ref = F.kl_div(
+                    #     student_log_prob,
+                    #     teacher_prob,
+                    #     reduction="batchmean",
+                    # ) * (tau_ref * tau_ref)
+                    ref_targets = ref_logits_all.argmax(dim=-1)   # [K]
+                    loss_ref = F.cross_entropy(
+                        student_logits_all[valid_mask].float(),
+                        ref_targets[valid_mask],
+                        reduction="mean",
                     )
-                    loss_ref = F.kl_div(
-                        student_log_prob,
-                        teacher_prob,
-                        reduction="batchmean",
-                    ) * (tau_ref * tau_ref)
                 else:
                     loss_ref = torch.zeros((), device=self.args.device)
             else:
