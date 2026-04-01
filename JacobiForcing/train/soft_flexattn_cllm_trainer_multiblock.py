@@ -372,7 +372,7 @@ class CllmTrainer(Trainer):
             output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
             if output is None:
                 print(f"[dataset] skip sample idx because T=0", flush=True)
-                total_loss = torch.zeros((), device=self.args.device)
+                total_loss = torch.zeros((), device=self.args.device, requires_grad=True)
                 with self.accelerator.accumulate(model):
                     self.accelerator.backward(total_loss)
                 losses.append(total_loss.detach())
@@ -410,6 +410,7 @@ class CllmTrainer(Trainer):
         return torch.stack(losses).mean()
 
     def _one_pass_losses_step(self, model, inputs):
+        
         input_ids, prompt_len, T = self._unpack_sample(inputs)
         # print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
         L = input_ids.size(0)

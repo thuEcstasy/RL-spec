@@ -357,16 +357,13 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
         # 你的 trainer 目前只用这个字段的长度来得到 T
         traj_position_indices = torch.arange(T, dtype=torch.long).unsqueeze(0)
-        if T == 0:
-            return None
-        else:
-            return {
-                "prompt_ids": prompt_ids_2d.squeeze(0).cpu(),
-                "prompt_ids_len": int(prompt_len),
-                "input_ids": input_ids,
-                "traj_position_indices": traj_position_indices,
-                "tokens_per_iter": rollout["tokens_per_iter"],
-            }
+        return {
+            "prompt_ids": prompt_ids_2d.squeeze(0).cpu(),
+            "prompt_ids_len": int(prompt_len),
+            "input_ids": input_ids,
+            "traj_position_indices": traj_position_indices,
+            "tokens_per_iter": rollout["tokens_per_iter"],
+        }
 
     def __iter__(self) -> Iterable[Dict[str, Any]]:
 
