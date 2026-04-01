@@ -385,23 +385,17 @@ class CllmTrainer(Trainer):
             torch.distributed.barrier()
 
         if output is not None and "tokens_per_iter" in output:
-            tpi_list = output["tokens_per_iter"]
-            if len(tpi_list) > 0:
-                tpi_mean_local = torch.tensor(
-                    [sum(tpi_list) / len(tpi_list)],
-                    dtype=torch.float,
-                    device=self.args.device,
-                )
+            tpi_local= output["tokens_per_iter"]
             else:
-                tpi_mean_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
+                tpi_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
         else:
-            tpi_mean_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
+            tpi_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
 
         if hasattr(self, "accelerator"):
-            tpi_mean_all = self.accelerator.gather(tpi_mean_local)
+            tpi_mean_all = self.accelerator.gather(tpi_local)
             tpi_mean = tpi_mean_all.mean().item()
         else:
-            tpi_mean = tpi_mean_local.item()
+            tpi_mean = tpi_local.item()
 
         return torch.stack(losses).mean()
 
