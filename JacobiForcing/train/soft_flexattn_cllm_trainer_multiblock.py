@@ -376,6 +376,9 @@ class CllmTrainer(Trainer):
             else:
                 losses.append(self._one_pass_losses_step(model, output))
 
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         self.train_step_cnt += 1
         
         did_sync = False
@@ -698,8 +701,5 @@ class CllmTrainer(Trainer):
 
         with self.accelerator.accumulate(model):
             self.accelerator.backward(total_loss)
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
 
         return total_loss.detach()
