@@ -639,25 +639,33 @@ class CllmTrainer(Trainer):
             loss_consistency = loss_consistency * (T_soft * T_soft) / T
 
             # =========================================================
-            # New ref loss: KL(student noisy logits || ref logits on same noisy chain)
-            # 实现上用 kl_div(log student, prob teacher) = KL(teacher || student)
+            # New ref loss: apply on ALL last_j positions (not just valid ones)
+            # ref_student is from block-structured clean forward, ref_teacher is from ref model on clean AR chain
             # =========================================================
             if self.ref_model is not None:
-                # map original positions in k_j blocks -> positions in noisy_concat_ids
-                orig2noisy = torch.full((L,), -1, dtype=torch.long, device=input_ids.device)
-                orig2noisy[:prompt_len] = torch.arange(prompt_len, device=input_ids.device)
+                # build positions for ALL tokens in last_j blocks
+                ref_student_pos_list = []
+                ref_teacher_pos_list = []
 
-                cursor = prompt_len
-                for ks in k_starts:
-                    orig2noisy[ks:ks + N] = torch.arange(cursor, cursor + N, device=input_ids.device)
-                    cursor += N
+                offs_full = torch.arange(N, device=input_ids.device, dtype=torch.long)
 
-                ref_pos = orig2noisy.index_select(0, sp)
-                if (ref_pos < 0).any():
-                    bad = (ref_pos < 0).nonzero(as_tuple=False).view(-1)[:8]
-                    raise RuntimeError(f"Found unmapped noisy positions for ref model: {bad.tolist()}")
+                for j in range(T):
+                    ls = l_starts[j]
+                    clean_base = prompt_len + j * N
 
-                # run ref model on clean chain
+                    # student positions: all positions inside last_j in full sequence
+                    ref_student_pos_list.append(ls + offs_full)
+
+                    # teacher positions: corresponding positions inside clean AR chain
+                    ref_teacher_pos_list.append(clean_base + offs_full)
+
+                ref_student_pos = torch.cat(ref_student_pos_list, dim=0)   # [T*N]
+                ref_teacher_pos = torch.cat(ref_teacher_pos_list, dim=0)   # [T*N]
+
+                # student logits from the block-structured forward
+                ref_student_logits = logits[0, ref_student_pos, :]         # [T*N, V]
+
+                # run ref model on clean AR chain: [prompt, last_0, ..., last_{T-1}]
                 with torch.no_grad():
                     ref_param = next(self.ref_model.parameters())
                     ref_device = ref_param.device
@@ -670,35 +678,19 @@ class CllmTrainer(Trainer):
                         attention_mask=ref_attn,
                         use_cache=False,
                     )
-                    ref_logits_full = ref_outputs.logits[0].to(input_ids.device)   # [L_noisy, V]
+                    ref_logits_full = ref_outputs.logits[0].to(input_ids.device)   # [prompt_len + T*N, V]
 
-                ref_logits_all = ref_logits_full.index_select(0, ref_pos)   # [K, V]
+                ref_logits_all = ref_logits_full.index_select(0, ref_teacher_pos)  # [T*N, V]
 
-                valid_mask = ~padding_mask
                 tau_ref = getattr(self.args, "ref_temperature", 1.0)
 
-                if valid_mask.any():
-                    student_log_prob = F.log_softmax(
-                        student_logits_all[valid_mask].float() / tau_ref,
-                        dim=-1,
-                    )
-                    # teacher_prob = F.softmax(
-                    #     ref_logits_all[valid_mask].float() / tau_ref,
-                    #     dim=-1,
-                    # )
-                    # loss_ref = F.kl_div(
-                    #     student_log_prob,
-                    #     teacher_prob,
-                    #     reduction="batchmean",
-                    # ) * (tau_ref * tau_ref)
-                    ref_targets = ref_logits_all.argmax(dim=-1)   # [K]
-                    loss_ref = F.cross_entropy(
-                        student_logits_all[valid_mask].float(),
-                        ref_targets[valid_mask],
-                        reduction="mean",
-                    )
-                else:
-                    loss_ref = torch.zeros((), device=self.args.device)
+                ref_targets = ref_logits_all.argmax(dim=-1)   # [T*N]
+
+                loss_ref = F.cross_entropy(
+                    ref_student_logits.float() / tau_ref,
+                    ref_targets,
+                    reduction="mean",
+                )
             else:
                 loss_ref = torch.zeros((), device=self.args.device)
 
