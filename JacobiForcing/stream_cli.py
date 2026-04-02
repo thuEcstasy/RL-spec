@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Implement quicksort algorithm in Python",
+        default="Design and implement a data structure that follows the constraints of a Least Recently Used (LRU) Cache.",
         help="直接传入 prompt 文本",
     )
     parser.add_argument(
