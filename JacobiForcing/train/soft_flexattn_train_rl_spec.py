@@ -41,6 +41,10 @@ class ModelArguments:
         default="models/vicuna-7b-v1.5",
         metadata={"help": "Path or HF id for the base model"},
     )
+    ref_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path or HF id for the ref model; if not specified, no ref loss will be used"},
+    )
     qlora: bool = field(default=False, metadata={"help": "Enable QLoRA"})
 
 
@@ -215,7 +219,7 @@ def train():
     # -------------------------
     
     ref_model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.target_model_path,
+        model_args.ref_model_path if model_args.ref_model_path is not None else model_args.target_model_path,
         config=config,
         cache_dir=training_args.cache_dir,
         attn_implementation=training_args.rollout_attn_implementation,
