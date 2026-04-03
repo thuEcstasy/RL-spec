@@ -31,18 +31,35 @@ def load_model(name, device):
     tokenizer = AutoTokenizer.from_pretrained(name)
     return model, tokenizer
 
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import glob
+
 def load_model_deepspeed(name, device):
+    shard_paths = sorted(glob.glob(os.path.join(name, "model-*-of-*.safetensors")))
+    
+    if not shard_paths:
+        raise FileNotFoundError(f"No safetensors shards found in {name}")
+    
+    print(f"Found {len(shard_paths)} shards")
+    
     clean_state_dict = {}
-    for i in range(1, 8):  # model-00001-of-00007.safetensors
-        path = os.path.join(name, f"model-{i:05d}-of-00007.safetensors")
+    for path in shard_paths:
         shard = load_file(path, device="cpu")
         for k, v in shard.items():
             clean_state_dict[k.removeprefix("module.")] = v
-    model = AutoModelForCausalLM.from_pretrained(
-        name,
-        torch_dtype=torch.float16,
-        state_dict=clean_state_dict
-    ).to(device)
+
+    config = AutoConfig.from_pretrained(name)
+    model = AutoModelForCausalLM.from_config(config)
+    model = model.half()
+
+    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+    if missing:
+        print(f"Missing keys ({len(missing)}): {missing[:5]}")
+    if unexpected:
+        print(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+
+    model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(name)
     return model, tokenizer
 
