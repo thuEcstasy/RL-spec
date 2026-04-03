@@ -25,7 +25,7 @@ def main():
 
     print(f"Found {len(pt_files)} .pt files")
     for pt_path in pt_files:
-        obj = torch.load(pt_path, map_location="cpu")
+        obj = torch.load(pt_path, map_location="cpu", weights_only=True)
 
         # 支持两种格式:
         # 1) 直接是 state_dict
