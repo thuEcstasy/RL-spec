@@ -42,15 +42,37 @@ records = df.to_dict(orient="records")
 # )
 # tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
 
-model_name = "/workspace/Zhaofeng/output/checkpoint-5000"
+from safetensors.torch import load_file
+import glob
 
+checkpoint_path = "/workspace/Zhaofeng/output/checkpoint-5000"
+base_model_name = "/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct"
+
+# 1) 用 base model 正确初始化（保证 attn_implementation、内部状态等全部正确）
 model = Qwen2ForCausalLM.from_pretrained(
-    model_name,
-    device_map="cuda",
+    base_model_name,
+    device_map="cpu",
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
 )
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# 2) 从 deepspeed checkpoint 加载权重，strip "module." prefix
+shard_paths = sorted(glob.glob(os.path.join(checkpoint_path, "model-*-of-*.safetensors")))
+clean_state_dict = {}
+for path in shard_paths:
+    shard = load_file(path, device="cpu")
+    for k, v in shard.items():
+        clean_state_dict[k.removeprefix("module.")] = v.to(torch.bfloat16)
+
+missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+if missing:
+    print(f"Missing keys: {missing[:10]}")
+if unexpected:
+    print(f"Unexpected keys: {unexpected[:10]}")
+
+model = model.to("cuda")
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 model.eval()
 
 
