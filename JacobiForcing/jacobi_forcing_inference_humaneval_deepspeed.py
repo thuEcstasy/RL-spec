@@ -42,41 +42,15 @@ records = df.to_dict(orient="records")
 # )
 # tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
 
-from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, AutoConfig
-import glob
+model_name = "/workspace/Zhaofeng/output/checkpoint-5000"
 
-def load_model_deepspeed(name, device):
-    shard_paths = sorted(glob.glob(os.path.join(name, "model-*-of-*.safetensors")))
-    
-    if not shard_paths:
-        raise FileNotFoundError(f"No safetensors shards found in {name}")
-    
-    print(f"Found {len(shard_paths)} shards")
-    
-    clean_state_dict = {}
-    for path in shard_paths:
-        shard = load_file(path, device="cpu")
-        for k, v in shard.items():
-            clean_state_dict[k.removeprefix("module.")] = v
-
-    config = AutoConfig.from_pretrained(name)
-    model = Qwen2ForCausalLM(config)
-    model = model.to(torch.bfloat16)
-
-    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
-    print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-    if missing:
-        print(f"Missing keys ({len(missing)}): {missing[:5]}")
-    if unexpected:
-        print(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-
-    model = model.to(device)
-    model = model.to(memory_format=torch.channels_last)
-    tokenizer = AutoTokenizer.from_pretrained(name)
-    return model, tokenizer
-
-model, tokenizer = load_model_deepspeed("/workspace/Zhaofeng/output/checkpoint-5000", device="cuda")
+model = Qwen2ForCausalLM.from_pretrained(
+    model_name,
+    device_map="cuda",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
+)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 model.eval()
 
 
