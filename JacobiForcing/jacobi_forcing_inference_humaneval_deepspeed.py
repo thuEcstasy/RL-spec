@@ -42,6 +42,10 @@ records = df.to_dict(orient="records")
 # )
 # tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
 
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoConfig
+import glob
+
 def load_model_deepspeed(name, device):
     shard_paths = sorted(glob.glob(os.path.join(name, "model-*-of-*.safetensors")))
     
@@ -57,19 +61,22 @@ def load_model_deepspeed(name, device):
             clean_state_dict[k.removeprefix("module.")] = v
 
     config = AutoConfig.from_pretrained(name)
-    model = AutoModelForCausalLM.from_config(config)
-    model = model.half()
+    model = Qwen2ForCausalLM(config)
+    model = model.to(torch.bfloat16)
 
     missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+    print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
     if missing:
         print(f"Missing keys ({len(missing)}): {missing[:5]}")
     if unexpected:
         print(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
 
     model = model.to(device)
+    model = model.to(memory_format=torch.channels_last)
     tokenizer = AutoTokenizer.from_pretrained(name)
-    
-model, tokenizer = load_model_deepspeed("/home/szf/huggingface/JacobiForcing_Coder_7B_v1", device="cuda")
+    return model, tokenizer
+
+model, tokenizer = load_model_deepspeed("/workspace/Zhaofeng/output/checkpoint-5000", device="cuda")
 model.eval()
 
 
