@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import pandas as pd
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from safetensors.torch import load_file
 
 PARQUET_PATH = "/mnt/szf_temp/_datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet"
 MAX_INPUT_TOKENS = 1024
@@ -27,6 +27,21 @@ def load_model(name, device):
     model = AutoModelForCausalLM.from_pretrained(
         name,
         torch_dtype=torch.float16
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(name)
+    return model, tokenizer
+
+def load_model_deepspeed(name, device):
+    clean_state_dict = {}
+    for i in range(1, 8):  # model-00001-of-00007.safetensors
+        path = os.path.join(name, f"model-{i:05d}-of-00007.safetensors")
+        shard = load_file(path, device="cpu")
+        for k, v in shard.items():
+            clean_state_dict[k.removeprefix("module.")] = v
+    model = AutoModelForCausalLM.from_pretrained(
+        name,
+        torch_dtype=torch.float16,
+        state_dict=clean_state_dict
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(name)
     return model, tokenizer
@@ -127,7 +142,7 @@ def main():
 
     elif rank == 1:
         # ===== GPU1: student =====
-        model, tokenizer = load_model(student_model_name, device)
+        model, tokenizer = load_model_deepspeed(student_model_name, device)
         kl_sum = 0.0
         kl_count = 0
         exact_match = 0
