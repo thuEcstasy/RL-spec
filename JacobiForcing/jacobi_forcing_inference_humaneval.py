@@ -20,10 +20,13 @@ path_root = Path(__file__).parents[1]
 sys.path.append(str(path_root))
 
 from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
+from modeling.cllm2_qwen2_modeling_kv_ablation_random_init import jacobi_forward_ablation_random_init
+Qwen2ForCausalLM.jacobi_forward_ablation_random_init = jacobi_forward_ablation_random_init
+
 Qwen2ForCausalLM.jacobi_forward_greedy = jacobi_forward_greedy
 
 # Load dataset
-df = pd.read_parquet("/home/szf/datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
+df = pd.read_parquet("/mnt/szf_temp/_datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
 df_size = len(df)
 print(f"Loaded HumanEval dataset with {df_size} samples")
 records = df.to_dict(orient="records")
@@ -32,7 +35,7 @@ records = df.to_dict(orient="records")
 # Load model/tokenizer once
 # ---------------------------
 # model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
-model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
+model_name = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
 
 model = Qwen2ForCausalLM.from_pretrained(
     model_name,
@@ -40,7 +43,7 @@ model = Qwen2ForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
 )
-tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct")
 model.eval()
 
 
@@ -51,9 +54,11 @@ alt_eos_id = 151645  # keep your special EOS as a fallback
 # Generation/profiling config
 # ---------------------------
 n_token_seq_len = 64
+# Draft init strategy: "random_from_history" (default) or "random_vocab"
+draft_init_strategy = "random_from_history"
 
 # Safety caps so a sample can't run forever.
-max_new_tokens = 32768     # hard cap on total new tokens per prompt
+max_new_tokens = 1024     # hard cap on total new tokens per prompt
 max_calls = 1024          # hard cap on number of diffusion_decoding calls per prompt
 
 # ---------------------------
@@ -86,6 +91,8 @@ Please continue to complete the function. You are not allowed to modify the give
 
     # per-example stats
     iters = []
+    rand_speedup = []
+    clean_speedup = []
     total_new_tokens = 0
     calls = 0
     prev_len = input_ids.shape[1]
@@ -120,6 +127,8 @@ Please continue to complete the function. You are not allowed to modify the give
             stop_reason = "max_calls"
             break
         
+        rand_itr = None
+        rand_info = None
         #print(f"\nInit new subsequence {calls}...\n")
 
         ### One diffusion decoding call
@@ -134,7 +143,7 @@ Please continue to complete the function. You are not allowed to modify the give
             prefill_input_ids = torch.cat((input_ids, prefill_draft_token_ids),dim=-1)
             
             # `jacobi_forward_greedy` will return iteration result from first iteration
-            past_key_values, first_correct_token, prefill_drafted_n_gram, iter_count = model.jacobi_forward_greedy(
+            past_key_values, first_correct_token, prefill_drafted_n_gram, iter_count, rand_info = model.jacobi_forward_ablation_random_init(
                 input_ids=prefill_input_ids,
                 attention_mask=attention_mask,
                 past_key_values=None,
@@ -155,16 +164,20 @@ Please continue to complete the function. You are not allowed to modify the give
                 # First non-prefill call: reuse draft_tokens produced by prefill
                 input_ids = prefill_drafted_n_gram
             else:
-                q_sampled = []
-                for _ in range(n_token_seq_len-1):
-                    q_sample = torch.tensor([random.choice(generated_ids[0].tolist())], dtype=torch.long, device=model.device).unsqueeze(0)
-                    q_sampled.append(q_sample)
-                q_sampled = torch.cat(q_sampled, dim=1)  # shape [1, n_token_seq_len-1]
+                if draft_init_strategy == "random_vocab":
+                    vocab_size = model.config.vocab_size
+                    q_sampled = torch.randint(0, vocab_size, (1, n_token_seq_len - 1), device=model.device)
+                else:  # "random_from_history"
+                    q_sampled = []
+                    for _ in range(n_token_seq_len-1):
+                        q_sample = torch.tensor([random.choice(generated_ids[0].tolist())], dtype=torch.long, device=model.device).unsqueeze(0)
+                        q_sampled.append(q_sample)
+                    q_sampled = torch.cat(q_sampled, dim=1)  # shape [1, n_token_seq_len-1]
                 input_ids = torch.cat((first_correct_token.view(1,-1), q_sampled),dim=-1)
 
             t_gen_start = time.perf_counter()
             accepted_history_ids = generated_ids[:, prompt_len:]
-            past_key_values, first_correct_token, accepted_n_gram, itr_count = model.jacobi_forward_greedy(
+            past_key_values, first_correct_token, accepted_n_gram, itr_count, rand_info = model.jacobi_forward_ablation_random_init(
                 input_ids=input_ids,
                 attention_mask=None,
                 past_key_values=past_key_values,
@@ -177,11 +190,19 @@ Please continue to complete the function. You are not allowed to modify the give
             )
             t_gen_time = time.perf_counter() - t_gen_start
             gen_only_time += t_gen_time
-            
+
             generated_ids = torch.cat((generated_ids, accepted_n_gram), dim=-1)
 
         calls += 1
         iters.append(itr_count)
+        if rand_info is not None and isinstance(rand_info, dict):
+            ral = rand_info.get("rand_accepted_per_itr", [])
+            clal = rand_info.get("clean_accepted_per_itr", [])
+            print(f"Iter {calls}: rand accepted per itr: {ral}, clean accepted per itr: {clal}")
+            if ral:
+                rand_speedup.append(sum(ral) / len(ral))
+                clean_speedup.append(sum(clal) / len(clal))
+
 
         added = generated_ids.shape[1] - prev_len
         if added > 0:
@@ -193,6 +214,8 @@ Please continue to complete the function. You are not allowed to modify the give
     # per-example finalize
     dt = time.time() - t_start
     total_iterations = sum(iters)
+    rand_speedup = (sum(rand_speedup) / len(rand_speedup))
+    clean_speedup = (sum(clean_speedup) / len(clean_speedup))
     avg_iter_per_call = (total_iterations / calls)
     avg_iter_per_token = (total_iterations / total_new_tokens)
     
@@ -218,6 +241,8 @@ Please continue to complete the function. You are not allowed to modify the give
             "time_sec": dt,
             "toks_per_sec": toks_per_sec,
             "stop_reason": stop_reason,
+            "rand_speedup": rand_speedup,
+            "clean_speedup": clean_speedup,
         }
     )
 
@@ -249,7 +274,7 @@ def extract_python_code(text):
     else:
         return text  # Return orginal one if no match is found
 
-eval_dir = "/home/szf/JacobiForcing/eval/CLLM2_eval_generations/baselines"
+eval_dir = "/mnt/szf_temp/RL-spec/eval/CLLM2_eval_generations/baselines"
 os.makedirs(eval_dir, exist_ok=True)
 
 original_path = os.path.join(eval_dir, 'humaneval_python_example_clean.jsonl')
@@ -295,6 +320,11 @@ print(f"Avg calls / prompt: {_safe_mean(df_eos['calls']):.4f}")
 print(f"Avg iterations / call: {_safe_mean(df_eos['avg_iter_per_call']):.4f}")
 print(f"Avg iterations / token: {_safe_mean(df_eos['avg_iter_per_token']):.4f}")
 print(f"Avg toks/sec: {_safe_mean(df_eos['toks_per_sec']):.4f}")
+
+
+print(f"Avg rand speedup: {_safe_mean(df_eos['rand_speedup']):.4f}")
+
+print(f"Avg clean speedup: {_safe_mean(df_eos['clean_speedup']):.4f}")
 
 # Optional: also show overall stop-reason distribution for context
 print("\nStop reasons (all examples):")
