@@ -686,6 +686,19 @@ class CllmTrainer(Trainer):
 
                 ref_targets = ref_logits_all.argmax(dim=-1)   # [T*N]
 
+                # ===== DEBUG PRINTING =====
+                if self.args.local_rank == 0:
+                    print(
+                        f"===== decoded last_N AR targets =====\n"
+                        f"{self.processing_class.decode(ref_targets[-64:])}\n==========\n",
+                        flush=True,
+                    )
+                    print(
+                        f"===== last_N AR tokens =====\n{ref_targets[-64:]}\n==========\n",
+                        flush=True,
+                    )
+                # ===== DEBUG PRINTING =====                
+
                 loss_ref = F.cross_entropy(
                     ref_student_logits.float() / tau_ref,
                     ref_targets,
