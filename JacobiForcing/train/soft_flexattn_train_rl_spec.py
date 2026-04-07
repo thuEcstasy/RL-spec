@@ -409,9 +409,15 @@ def train():
         num_training_steps=max_train_steps,
     )
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
+    if data_args.online_jacobi_sampling:
+        # IterableDataset already shards by rank in __iter__; skip accelerator sharding
+        model, optimizer, lr_scheduler = accelerator.prepare(
+            model, optimizer, lr_scheduler
+        )
+    else:
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, lr_scheduler
+        )
 
     trainer = CllmTrainer(
         model=model,

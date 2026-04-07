@@ -352,12 +352,21 @@ def jacobi_forward_ablation_random_init(
 
         batch, out, device = input_ids.shape[0], input_ids, input_ids.device
 
-        # Build parallel random draft (same first token, random tail)
+        # Pool for random sampling: prefer accepted_history_ids, fallback to out
+        def _rand_from_pool(n):
+            """Sample n tokens from history pool."""
+            if accepted_history_ids is not None and accepted_history_ids.numel() > 0:
+                pool = accepted_history_ids.view(-1)
+            else:
+                pool = out.view(-1)
+            idx = torch.randint(0, pool.shape[0], (n,), device=device)
+            return pool[idx].unsqueeze(0)  # [1, n]
+
+        # Build parallel random draft (same first token, random tail from history)
         if out.shape[1] > 1:
-            out_rand = torch.cat(
-                (out[:, :1], torch.randint(0, vocab_size, (1, out.shape[1] - 1), device=device)),
-                dim=-1,
-            )
+            # out_rand = torch.cat((out[:, :1], _rand_from_pool(out.shape[1] - 1)), dim=-1)
+            # using randint instead
+            out_rand = torch.cat((out[:, :1], torch.randint(0, vocab_size, (1, out.shape[1] - 1), device=device)), dim=-1)
         else:
             out_rand = out.clone()
 
@@ -862,13 +871,11 @@ def jacobi_forward_ablation_random_init(
                     q_sampled = torch.argmax(q_probs_rem, dim=-1)  # [1, L']
                     out = torch.cat((out, q_sampled), dim=-1)
 
-                # Build parallel random draft (same first token, random tail)
+                # Build parallel random draft (same first token, random tail from history)
                 rand_tail_len = out.shape[1] - 1
                 if rand_tail_len > 0:
-                    out_rand = torch.cat(
-                        (next_token, torch.randint(0, vocab_size, (1, rand_tail_len), device=device)),
-                        dim=-1,
-                    )
+                    # out_rand = torch.cat((next_token, _rand_from_pool(rand_tail_len)), dim=-1)
+                    out_rand = torch.cat((out[:, :1], torch.randint(0, vocab_size, (next_token.shape[0], rand_tail_len), device=device)), dim=-1)
                 else:
                     out_rand = next_token.clone()
 
@@ -884,8 +891,8 @@ def jacobi_forward_ablation_random_init(
                         pad_tokens = pool[:, rand_idx]
                         out = torch.cat((out, pad_tokens), dim=-1)
                         # pad out_rand to same length
-                        rand_pad = torch.randint(0, vocab_size, (1, pad_len), device=device)
-                        out_rand = torch.cat((out_rand, rand_pad), dim=-1)
+                        # out_rand = torch.cat((out_rand, _rand_from_pool(pad_len)), dim=-1)
+                        out_rand = torch.cat((out_rand, torch.randint(0, vocab_size, (out_rand.shape[0], pad_len), device=device)), dim=-1)
                     elif out.shape[1] > n_token_seq_len:
                         out = out[:, :n_token_seq_len]
                         out_rand = out_rand[:, :n_token_seq_len]

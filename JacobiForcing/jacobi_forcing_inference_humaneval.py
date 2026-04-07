@@ -35,7 +35,7 @@ records = df.to_dict(orient="records")
 # Load model/tokenizer once
 # ---------------------------
 # model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
-model_name = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
+model_name = "/mnt/szf_temp/huggingface/JacobiForcing_Coder_7B_v1"
 
 model = Qwen2ForCausalLM.from_pretrained(
     model_name,

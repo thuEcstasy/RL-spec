@@ -23,7 +23,7 @@ from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_fo
 Qwen2ForCausalLM.jacobi_forward_greedy = jacobi_forward_greedy
 
 # Load dataset
-df = pd.read_parquet("/home/szf/datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
+df = pd.read_parquet("/mnt/szf_temp/_datasets/openai_humaneval/openai_humaneval/test-00000-of-00001_clean.parquet")
 df_size = len(df)
 print(f"Loaded HumanEval dataset with {df_size} samples")
 records = df.to_dict(orient="records")
@@ -46,7 +46,7 @@ from safetensors.torch import load_file
 import glob
 
 checkpoint_path = "/workspace/Zhaofeng/output/checkpoint-5000"
-base_model_name = "/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct"
+base_model_name = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
 
 # 1) 用 base model 正确初始化（保证 attn_implementation、内部状态等全部正确）
 model = Qwen2ForCausalLM.from_pretrained(
