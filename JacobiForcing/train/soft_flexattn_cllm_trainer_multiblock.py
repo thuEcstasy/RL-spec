@@ -689,12 +689,12 @@ class CllmTrainer(Trainer):
                 # ===== DEBUG PRINTING =====
                 if self.args.local_rank == 0:
                     print(
-                        f"===== decoded last_N AR targets =====\n"
+                        f"===== decoded last_N ref targets =====\n"
                         f"{self.processing_class.decode(ref_targets[-64:])}\n==========\n",
                         flush=True,
                     )
                     print(
-                        f"===== last_N AR tokens =====\n{ref_targets[-64:]}\n==========\n",
+                        f"===== last_N ref tokens =====\n{ref_targets[-64:]}\n==========\n",
                         flush=True,
                     )
                 # ===== DEBUG PRINTING =====                

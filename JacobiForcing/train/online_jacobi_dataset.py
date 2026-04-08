@@ -161,7 +161,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         self.rank = 0
         self.world_size = 1
         self.global_idx = 0
-        self.noise_schedule = [24, 20, 16, 12, 8] # TODO: maybe tune this
+        self.noise_schedule = [24, 20, 16, 12, 8] if self.cfg.n_token_seq_len == 32 else [12, 11, 10, 9, 8, 7, 6, 5, 4] # TODO: maybe tune this
 
         # 给不同 epoch 做打乱用
         self.epoch = 0
@@ -305,8 +305,9 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
                 accepted_history_ids=accepted_history_ids,
                 eos_token_id=self.tokenizer.eos_token_id,
                 capture_noisy_block=True,
-                capture_len=n_token_seq_len * self.noise_schedule[self.global_idx % len(self.noise_schedule)] // self.cfg.block_size, # TODO: maybe tune this
+                capture_len=self.noise_schedule[self.global_idx % len(self.noise_schedule)], # TODO: maybe tune this
             )
+            print("capture len =", self.noise_schedule[self.global_idx % len(self.noise_schedule)], flush=True)
             self.global_idx += 1
             if accepted_n_gram is None or accepted_n_gram.numel() == 0:
                 break
