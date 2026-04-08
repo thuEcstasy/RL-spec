@@ -16,3 +16,4 @@ JacobiForcing/outputs
 
 *.tar*
 *.sh
+*.out

@@ -34,8 +34,10 @@ RUN conda env update -n jacobi_forcing -f /tmp/environment.yml
 RUN conda run -n jacobi_forcing pip install flash-attn==2.8.3 --no-deps --no-cache-dir --no-build-isolation
 
 
-SHELL ["conda", "run", "-n", "jacobi_forcing", "/bin/bash", "-c"]
-
 COPY . /workspace
 
+# 让 bash 启动时自动激活 conda 环境
+RUN echo ". /opt/conda/etc/profile.d/conda.sh && conda activate jacobi_forcing" >> /root/.bashrc
+
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/conda/etc/profile.d/conda.sh && conda activate jacobi_forcing && exec \"$@\"", "--"]
 CMD ["/bin/bash"]
