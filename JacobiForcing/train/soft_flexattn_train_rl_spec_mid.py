@@ -13,6 +13,9 @@ import math
 import os
 import sys
 import pathlib
+import glob
+from safetensors.torch import load_file
+
 
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import DataLoaderConfiguration
@@ -23,7 +26,7 @@ from pathlib import Path
 path_root = Path(__file__).parents[0]
 sys.path.append(str(path_root))
 
-from soft_flexattn_cllm_trainer_multiblock import CllmTrainer
+from soft_flexattn_cllm_trainer_multiblock_v2 import CllmTrainer
 from online_jacobi_dataset import (
     PromptOnlyDataset,
     OnlineJacobiTrajectoryDataset,
@@ -89,6 +92,14 @@ class TrainingArguments(transformers.TrainingArguments):
     rollout_device: Optional[str] = field(default=None)
     rollout_bf16: bool = field(default=True)
     ref_weight: float = field(default=10.0, metadata={"help": "Weight for the ref model in the loss; 0 means no ref model"})
+
+    # validation (Jacobi speed on HumanEval)
+    val_humaneval_path: Optional[str] = field(
+        default="/mnt/szf_temp/_datasets/openai_humaneval/openai_humaneval/test-00000-of-00001.parquet",
+        metadata={"help": "Path to HumanEval parquet for tokens/iter validation"},
+    )
+    val_every_steps: int = field(default=1000, metadata={"help": "Run validation every N steps (0 = disabled)"})
+    val_max_samples: int = field(default=0, metadata={"help": "Max val samples (0 = all)"})
 
 def rank0_print(local_rank, *args):
     if local_rank in (0, -1):
@@ -228,6 +239,7 @@ def train():
     )
     
     # 2) 从 deepspeed checkpoint 加载权重，strip "module." prefix
+    model_args.ref_model_path = model_args.ref_model_path or model_args.target_model_path
     shard_paths = sorted(glob.glob(os.path.join(model_args.ref_model_path, "model-*-of-*.safetensors")))
     clean_state_dict = {}
     for path in shard_paths:
@@ -235,7 +247,7 @@ def train():
         for k, v in shard.items():
             clean_state_dict[k.removeprefix("module.")] = v.to(torch.bfloat16)
 
-    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+    missing, unexpected = ref_model.load_state_dict(clean_state_dict, strict=False)
     
     ref_device = training_args.rollout_device
     if ref_device is None:
@@ -440,6 +452,29 @@ def train():
         trainer.rollout_dataset = data_module["train_dataset"]
     else:
         trainer.rollout_dataset = None
+
+    # Load HumanEval validation set for tokens/iter tracking
+    trainer.val_prompt_dataset = None
+    if training_args.val_humaneval_path and os.path.exists(training_args.val_humaneval_path):
+        import pandas as pd
+        val_df = pd.read_parquet(training_args.val_humaneval_path)
+        val_records = val_df.to_dict(orient="records")
+        # wrap as PromptOnlyDataset (each record has "prompt" field)
+        val_prompt_data = []
+        for row in val_records:
+            prompt_text = (
+                "Please continue to complete the function. You are not allowed to modify the given code "
+                "and do the completion only. Please return all completed function in a codeblock. "
+                "Here is the given code to do completion:\n```python\n{}\n```"
+            ).format(row["prompt"].strip())
+            val_prompt_data.append({"prompt": prompt_text})
+
+        trainer.val_prompt_dataset = PromptOnlyDataset(
+            raw_data=val_prompt_data,
+            tokenizer=tokenizer,
+            model_max_length=training_args.model_max_length,
+        )
+        rank0_print(local_rank, f"[val] Loaded {len(val_prompt_data)} HumanEval prompts for validation")
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

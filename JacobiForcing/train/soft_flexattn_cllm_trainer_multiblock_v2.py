@@ -1,5 +1,7 @@
 import torch
 import wandb
+import random
+import time
 from torch.cuda.amp import autocast
 from transformers import Trainer
 from transformers.trainer_pt_utils import LabelSmoother
@@ -448,6 +450,173 @@ class CllmTrainer(Trainer):
 
         rollout_model.eval()
 
+    # =========================================================
+    # Validation: Jacobi tokens/iter on HumanEval
+    # =========================================================
+    @torch.no_grad()
+    def evaluate_jacobi_speed(self, max_samples: int = 0):
+        """
+        DP-style validation: each rank processes its shard of HumanEval,
+        then all-reduce to get global average tokens/iter.
+        """
+        if not hasattr(self, "val_prompt_dataset") or self.val_prompt_dataset is None:
+            return
+
+        ds = self.rollout_dataset
+        if ds is None or ds.rollout_model is None:
+            return
+
+        rollout_model = ds.rollout_model
+        rollout_model.eval()
+        device = next(rollout_model.parameters()).device
+        tokenizer = self.processing_class
+
+        from pathlib import Path
+        import sys
+        project_root = Path(__file__).resolve().parents[1]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
+        if not hasattr(rollout_model.__class__, "jacobi_forward_greedy"):
+            rollout_model.__class__.jacobi_forward_greedy = jacobi_forward_greedy
+
+        n_token_seq_len = ds.cfg.n_token_seq_len
+        max_new_tokens = 1024
+        max_calls = 1024
+        eos_id = tokenizer.eos_token_id
+        alt_eos_id = ds.cfg.alt_eos_id
+
+        val_ds = self.val_prompt_dataset
+        n_total = len(val_ds)
+        if max_samples > 0:
+            n_total = min(n_total, max_samples)
+
+        # DP shard: each rank takes its slice
+        rank = max(self.args.local_rank, 0)
+        world_size = max(self.args.world_size, 1) if hasattr(self.args, "world_size") else 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        my_indices = list(range(rank, n_total, world_size))
+
+        local_tpi_sum = 0.0
+        local_tok_sum = 0.0
+        local_count = 0
+        t0 = time.perf_counter()
+
+        for i in my_indices:
+            sample = val_ds[i]
+            prompt_ids = sample["prompt_ids"].to(device).unsqueeze(0)
+            attention_mask = torch.ones_like(prompt_ids, device=device)
+            prompt_len = prompt_ids.shape[1]
+
+            generated_ids = prompt_ids.clone()
+            past_key_values = None
+            first_correct_token = None
+            prefill_phase = True
+            prefill_drafted_n_gram = None
+
+            total_new_tokens = 0
+            calls = 0
+            iters = []
+
+            while True:
+                generated_part = generated_ids[0, prompt_len:]
+                hit_eos = False
+                if eos_id is not None:
+                    hit_eos = (generated_part == eos_id).any().item()
+                if not hit_eos and alt_eos_id is not None:
+                    hit_eos = (generated_part == alt_eos_id).any().item()
+                if hit_eos:
+                    break
+                if total_new_tokens >= max_new_tokens:
+                    break
+                if calls >= max_calls:
+                    break
+
+                if prefill_phase:
+                    flat = generated_ids[0].tolist()
+                    q_sampled = [random.choice(flat) for _ in range(n_token_seq_len)]
+                    draft = torch.tensor([q_sampled], dtype=torch.long, device=device)
+                    prefill_input_ids = torch.cat((prompt_ids, draft), dim=-1)
+
+                    past_key_values, first_correct_token, prefill_drafted_n_gram, _, _ = rollout_model.jacobi_forward_greedy(
+                        input_ids=prefill_input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        use_cache=True,
+                        prefill_phase=True,
+                        n_token_seq_len=n_token_seq_len,
+                        tokenizer=tokenizer,
+                        eos_token_id=eos_id,
+                    )
+                    prefill_phase = False
+                    calls += 1
+                    continue
+
+                if calls == 1:
+                    step_input_ids = prefill_drafted_n_gram
+                else:
+                    flat = generated_ids[0].tolist()
+                    q_sampled = [random.choice(flat) for _ in range(n_token_seq_len - 1)]
+                    tail = torch.tensor([q_sampled], dtype=torch.long, device=device)
+                    step_input_ids = torch.cat((first_correct_token.view(1, -1), tail), dim=-1)
+
+                accepted_history_ids = generated_ids[:, prompt_len:]
+                past_key_values, first_correct_token, accepted_n_gram, itr, _ = rollout_model.jacobi_forward_greedy(
+                    input_ids=step_input_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    prefill_phase=False,
+                    n_token_seq_len=n_token_seq_len,
+                    tokenizer=tokenizer,
+                    accepted_history_ids=accepted_history_ids,
+                    eos_token_id=eos_id,
+                )
+
+                if accepted_n_gram is None or accepted_n_gram.numel() == 0:
+                    break
+
+                generated_ids = torch.cat((generated_ids, accepted_n_gram), dim=-1)
+                iters.append(itr)
+                total_new_tokens = generated_ids.shape[1] - prompt_len
+                calls += 1
+
+            total_iters = sum(iters)
+            if total_iters > 0 and total_new_tokens > 0:
+                local_tpi_sum += total_new_tokens / total_iters
+                local_tok_sum += total_new_tokens
+                local_count += 1
+
+        # All-reduce across ranks
+        stats = torch.tensor([local_tpi_sum, local_tok_sum, float(local_count)],
+                             dtype=torch.float64, device=self.args.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        global_tpi_sum, global_tok_sum, global_count = stats.tolist()
+        global_count = int(global_count)
+
+        dt = time.perf_counter() - t0
+        if global_count > 0:
+            avg_tpi = global_tpi_sum / global_count
+            avg_tokens = global_tok_sum / global_count
+        else:
+            avg_tpi = 0.0
+            avg_tokens = 0.0
+
+        if self.args.local_rank in (0, -1):
+            print(f"\n[val] step={self.train_step_cnt} | samples={global_count}/{n_total} | "
+                  f"avg tokens/iter={avg_tpi:.3f} | avg_new_tokens={avg_tokens:.1f} | "
+                  f"wall={dt:.1f}s (rank0, {len(my_indices)} local)\n", flush=True)
+
+            wandb.log({
+                "val/tokens_per_iter": avg_tpi,
+                "val/avg_new_tokens": avg_tokens,
+                "val/n_samples": global_count,
+            }, step=self.train_step_cnt)
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         # [B, L]
         bsz = inputs["prompt_ids"].size(0)
@@ -477,6 +646,14 @@ class CllmTrainer(Trainer):
             
         if did_sync and torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # Periodic validation on HumanEval
+        val_every = getattr(self.args, "val_every_steps", 1000)
+        val_max_samples = getattr(self.args, "val_max_samples", 0)
+        if val_every > 0 and (self.train_step_cnt == 1 or self.train_step_cnt % val_every == 0):
+            self.evaluate_jacobi_speed(max_samples=val_max_samples)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
         if output is not None and "tokens_per_iter" in output:
             tpi_local = torch.tensor(
@@ -702,6 +879,36 @@ class CllmTrainer(Trainer):
                 pw,
             )
             loss_consistency = loss_consistency * (T_soft * T_soft) / T
+
+            if self.args.local_rank == 0 and self.train_step_cnt % 10 == 0:
+                with torch.no_grad():
+                    # per-block weight detail
+                    for j in range(T):
+                        ks_j, ls_j = k_starts[j], l_starts[j]
+                        w_j = self._block_position_weights(
+                            input_ids, ks_j, ls_j, N, eos_id=eos_id,
+                            correct_weight=correct_weight,
+                            diverge_weight=diverge_weight,
+                            min_weight=min_weight,
+                        )
+                        k_block = input_ids[ks_j:ks_j+N]
+                        l_block = input_ids[ls_j:ls_j+N]
+                        diff_j = (k_block != l_block)
+                        first_diff = "none"
+                        if diff_j.any():
+                            first_diff = int(torch.nonzero(diff_j, as_tuple=False)[0])
+
+                        lines = [f"  [weight] j={j}  first_diff={first_diff}"]
+                        # for t in range(N):
+                        #     tag = "C" if not diff_j[t] else "D"  # C=correct, D=diverge
+                        #     k_tok = int(k_block[t])
+                        #     l_tok = int(l_block[t])
+                        #     w_val = w_j[t].item()
+                        #     lines.append(
+                        #         f"    off={t:2d} [{tag}] w={w_val:.3f}  "
+                        #         f"k={k_tok:6d}  l={l_tok:6d}"
+                        #     )
+                        # print("\n".join(lines), flush=True)
 
             # =========================================================
             # New ref loss: apply on ALL last_j positions (not just valid ones)
