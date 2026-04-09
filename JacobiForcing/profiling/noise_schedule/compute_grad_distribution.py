@@ -20,6 +20,9 @@ from train.soft_flexattn_train_rl_spec import ModelArguments, DataArguments, Tra
 data_path = "/mnt/szf_temp/datasets/OpenCodeInstruct/data/first_10000.jsonl"
 rollout_model_path = "/mnt/szf_temp/huggingface/JacobiForcing_Coder_7B_v1"
 model_path = "/mnt/szf_temp/huggingface/JacobiForcing_Coder_7B_v1"
+# rollout_model_path = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
+# model_path = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
+ref_model_path = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
 input_path = "/mnt/szf_temp/datasets/OpenCodeInstruct/data/first_10000.jsonl"
 
 parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -48,6 +51,15 @@ rollout_model = transformers.AutoModelForCausalLM.from_pretrained(
 )
 rollout_model.to("cuda:1")
 rollout_model.eval()
+
+ref_model = transformers.AutoModelForCausalLM.from_pretrained(
+    ref_model_path,
+    attn_implementation="flash_attention_2",
+    torch_dtype=torch.bfloat16,
+    low_cpu_mem_usage=False,
+)
+ref_model.to("cuda:1")
+ref_model.eval()
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(
     rollout_model_path,
@@ -244,7 +256,7 @@ for i, sample in enumerate(dataset):
         """
         Returns [N-1] bool if drop_last_offset else [N] bool.
         True => keep offset t for logits at position (start+t) predicting next token (t+1).
-        We: start computing loss after first divergence.
+        We: start computing loss after first divergence, and stop at EOS.
         """
         device = input_ids.device
         size = N - 1 if drop_last_offset else N
@@ -261,17 +273,20 @@ for i, sample in enumerate(dataset):
         else:
             div_keep = torch.zeros(size, dtype=torch.bool, device=device)
 
-        # UNUSED — EOS mask: keep offsets t such that (t+1) is BEFORE EOS in both blocks
-        #def keep_next_before_eos(block):
-        #    if eos_id is None:
-        #        return torch.ones(size, dtype=torch.bool, device=device)
-        #    pos = torch.nonzero(block == eos_id, as_tuple=False)
-        #    if pos.numel() == 0:
-        #        return torch.ones(size, dtype=torch.bool, device=device)
-        #    e = int(pos[0])          # EOS index within [0..N-1]
-        #    return offs < e
-
-        #eos_keep = keep_next_before_eos(k_block) & keep_next_before_eos(l_block)
+        # EOS mask: logits at offset t predict token t+1; if EOS is at offset e
+        # in last_j, then offsets >= e are predicting post-EOS → mask them out
+        _eos_ids = {eos_id} if eos_id is not None else set()
+        _im_end_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
+        if _im_end_id is not None:
+            _eos_ids.add(_im_end_id)
+        if _eos_ids:
+            is_eos = torch.zeros(N, dtype=torch.bool, device=device)
+            for eid in _eos_ids:
+                is_eos |= (l_block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                div_keep = div_keep & (offs < first_eos)
 
         return div_keep
     def _build_padding_mask_for_loss(input_ids: torch.Tensor, prompt_len: int, T: int) -> torch.Tensor:
@@ -392,7 +407,10 @@ for i, sample in enumerate(dataset):
                 input_ids, k_starts[j], l_starts[j], N, eos_id=eos_id, drop_last_offset=True,
             )  # [N-1] bool: True from first diff onward, excludes last offset
             # pad to N with False for offset N-1
-            keep_parts.append(F.pad(div_mask, (0, 1), value=False))
+            padded = F.pad(div_mask, (0, 1), value=False)
+            kept_offsets = padded.nonzero(as_tuple=False).squeeze(-1).tolist()
+            print(f"  [consistency keep] block j={j}: kept offsets = {kept_offsets} ({len(kept_offsets)}/{N})")
+            keep_parts.append(padded)
         keep = torch.cat(keep_parts, dim=0)  # [T*N]
 
         # filter down to noised positions only
@@ -417,18 +435,34 @@ for i, sample in enumerate(dataset):
                 )
             mode_logits[mode] = outputs.logits[0]  # [L, V]
 
+        # ===== ref model prefill on clean AR chain =====
+        ref_ar_pos = torch.tensor(
+            [prompt_len + int(block_j_idx_f[i]) * N + int(intra_idx_f[i])
+             for i in range(blk_k_pos_f.size(0))],
+            device="cuda", dtype=torch.long,
+        )
+        with torch.no_grad():
+            ref_outputs = ref_model(
+                input_ids=ar_concat_ids.unsqueeze(0).to("cuda:1"),
+                attention_mask=torch.ones(1, ar_concat_ids.size(0), device="cuda:1", dtype=torch.long),
+                use_cache=False,
+            )
+            ref_logits_full = ref_outputs.logits[0].to("cuda")  # [prompt_len + T*N, V]
+
         # ===== precompute log-probs and top-K for both modes + clean =====
         K = 10
         M = blk_k_pos_f.size(0)
 
-        # clean: last_j logits are identical across modes, take from "same"
-        clean_log_p = F.log_softmax(mode_logits["same"][blk_last_pos_f].float(), dim=-1)  # [M, V]
+        clean_log_p = F.log_softmax(mode_logits["same"][blk_last_pos_f].float(), dim=-1)
         clean_topk_vals, clean_topk_ids = clean_log_p.topk(K, dim=-1)
+
+        ref_log_p = F.log_softmax(ref_logits_full[ref_ar_pos].float(), dim=-1)
+        ref_topk_vals, ref_topk_ids = ref_log_p.topk(K, dim=-1)
 
         mode_data = {}
         for mode in ("same", "cross"):
             logits_full = mode_logits[mode]
-            noisy_log_p = F.log_softmax(logits_full[blk_k_pos_f].float(), dim=-1)     # [M, V]
+            noisy_log_p = F.log_softmax(logits_full[blk_k_pos_f].float(), dim=-1)
             topk_vals, topk_ids = noisy_log_p.topk(K, dim=-1)
             kl = F.kl_div(noisy_log_p, clean_log_p, log_target=True, reduction="batchmean")
             mode_data[mode] = {
@@ -439,10 +473,12 @@ for i, sample in enumerate(dataset):
             }
 
         # ===== print summary KL =====
+        kl_ref = F.kl_div(ref_log_p, clean_log_p, log_target=True, reduction="batchmean")
+        print(f"[mode=ref  ] KL(clean || ref)   = {kl_ref.item():.6f}  ({M} noised positions)")
         for mode in ("same", "cross"):
             print(f"[mode={mode:5s}] KL(clean || noisy) = {mode_data[mode]['kl'].item():.6f}  ({M} noised positions)")
 
-        # ===== print per-position: clean, same, cross =====
+        # ===== print per-position: clean, ref, same, cross =====
         for i in range(M):
             j = int(block_j_idx_f[i])
             off = int(intra_idx_f[i])
@@ -458,13 +494,16 @@ for i, sample in enumerate(dataset):
                   f"golden_next: {repr(golden_str)} | "
                   f"input_clean: {repr(clean_input_str)} | input_noisy: {repr(noisy_input_str)}")
 
-            # clean
             golden_clean_lp = float(clean_log_p[i, golden_tok])
             clean_toks = [f"{repr(tokenizer.decode([int(clean_topk_ids[i,k])]))} ({float(clean_topk_vals[i,k]):.4f})"
                           for k in range(K)]
             print(f"  [clean] golden_lp={golden_clean_lp:.4f} | top{K}: {' | '.join(clean_toks)}")
 
-            # same, cross
+            golden_ref_lp = float(ref_log_p[i, golden_tok])
+            ref_toks = [f"{repr(tokenizer.decode([int(ref_topk_ids[i,k])]))} ({float(ref_topk_vals[i,k]):.4f})"
+                        for k in range(K)]
+            print(f"  [ref  ] golden_lp={golden_ref_lp:.4f} | top{K}: {' | '.join(ref_toks)}")
+
             for mode in ("same", "cross"):
                 d = mode_data[mode]
                 golden_lp = float(d["noisy_log_p"][i, golden_tok])
@@ -472,6 +511,179 @@ for i, sample in enumerate(dataset):
                         for k in range(K)]
                 print(f"  [{mode:5s}] golden_lp={golden_lp:.4f} | top{K}: {' | '.join(toks)}")
 
+        # =================================================================
+        # ===== Compute loss_consistency + loss_ref with backward =====
+        # =================================================================
+        T_soft = 1.0
+        tau_ref = 1.0
+        padding_mask_consistency = torch.zeros(M, dtype=torch.bool, device="cuda")
+
+        # ref loss shared setup: ALL last_j positions
+        offs_full_all = torch.arange(N, device="cuda")
+        ref_student_pos_list = []
+        ref_teacher_pos_list = []
+        for j in range(T):
+            ls = l_starts[j]
+            clean_base = prompt_len + j * N
+            ref_student_pos_list.append(ls + offs_full_all)
+            ref_teacher_pos_list.append(clean_base + offs_full_all)
+        ref_student_pos = torch.cat(ref_student_pos_list, dim=0)  # [T*N]
+        ref_teacher_pos = torch.cat(ref_teacher_pos_list, dim=0)  # [T*N]
+        ref_teacher_logits = ref_logits_full.index_select(0, ref_teacher_pos)  # [T*N, V]
+        ref_targets = ref_teacher_logits.argmax(dim=-1)  # [T*N]
+
+        # Mask out positions after EOS / <|im_end|> in each last_j block
+        eos_ids = {tokenizer.eos_token_id}
+        im_end_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
+        if im_end_id is not None and im_end_id != tokenizer.unk_token_id:
+            eos_ids.add(im_end_id)
+        for j in range(T):
+            ls = l_starts[j]
+            block = input_ids[ls:ls + N]
+            # find first occurrence of any EOS-like token
+            is_eos = torch.zeros(N, dtype=torch.bool, device=block.device)
+            for eid in eos_ids:
+                is_eos |= (block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                # mask from first_eos (inclusive): logits at first_eos predict post-EOS token
+                start_idx = j * N + first_eos
+                end_idx = (j + 1) * N
+                print(f"  [EOS mask] block j={j}: EOS at off={first_eos}, masking ref_targets[{start_idx}:{end_idx}]")
+                if start_idx < end_idx:
+                    ref_targets[start_idx:end_idx] = -100
+        
+
+        results = {}  # mode -> {loss_consistency, loss_ref, grad_norm_consistency, ...}
+
+        for attn_mode in ("same", "cross"):
+            print(f"\n\n{'#'*80}")
+            print(f"# LOSS & GRADIENT ANALYSIS (mode={attn_mode})")
+            print(f"{'#'*80}")
+
+            blk_mask = _build_block_mask(L, prompt_len, T, num_heads, mode=attn_mode)
+
+            # ----- Forward #1: consistency loss -----
+            model.zero_grad()
+            outputs_c = model(
+                input_ids=input_ids.unsqueeze(0),
+                attention_mask=blk_mask,
+                position_ids=position_ids.unsqueeze(0),
+            )
+            logits_c = outputs_c.logits
+
+            student_logits = logits_c[0, blk_k_pos_f, :] / T_soft
+            teacher_logits = logits_c[0, blk_last_pos_f, :].detach() / T_soft
+
+            loss_consistency = soft_cross_entropy(
+                student_logits.float(),
+                teacher_logits.float(),
+                padding_mask_consistency,
+            ) * (T_soft * T_soft) / T
+
+            print(f"\nloss_consistency = {loss_consistency.item():.6f}")
+
+            loss_consistency.backward()
+            grad_norm_consistency = 0.0
+            grad_norms_per_layer_consistency = {}
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    pnorm = p.grad.float().norm().item()
+                    grad_norm_consistency += pnorm ** 2
+                    grad_norms_per_layer_consistency[name] = pnorm
+            grad_norm_consistency = grad_norm_consistency ** 0.5
+            print(f"  grad_norm(consistency) = {grad_norm_consistency:.6f}")
+
+            sorted_layers = sorted(grad_norms_per_layer_consistency.items(), key=lambda x: -x[1])[:5]
+            for lname, lnorm in sorted_layers:
+                print(f"    {lname}: {lnorm:.6f}")
+
+            # ----- Forward #2: ref loss -----
+            model.zero_grad()
+            outputs_r = model(
+                input_ids=input_ids.unsqueeze(0),
+                attention_mask=blk_mask,
+                position_ids=position_ids.unsqueeze(0),
+            )
+            logits_r = outputs_r.logits
+
+            ref_student_logits = logits_r[0, ref_student_pos, :]
+
+            # ----- DEBUG: per-position log-prob of ref target under student -----
+            with torch.no_grad():
+                student_lp = F.log_softmax(ref_student_logits.float() / tau_ref, dim=-1)  # [T*N, V]
+                valid_mask = ref_targets != -100
+                student_argmax = ref_student_logits.argmax(dim=-1)
+
+                # only compute stats on valid (non-masked) positions
+                valid_targets = ref_targets[valid_mask]
+                valid_lp = student_lp[valid_mask]
+                target_lp = valid_lp[torch.arange(valid_targets.size(0), device="cuda"), valid_targets]
+                valid_argmax = student_argmax[valid_mask]
+                agree = (valid_argmax == valid_targets).sum().item()
+                total_valid = valid_targets.size(0)
+                total_all = ref_targets.size(0)
+
+                print(f"\n  [ref debug] valid positions: {total_valid}/{total_all} (masked {total_all - total_valid} post-EOS)")
+                print(f"  [ref debug] student log-prob at ref_target: "
+                      f"mean={target_lp.mean().item():.4f}  min={target_lp.min().item():.4f}  max={target_lp.max().item():.4f}")
+                print(f"  [ref debug] argmax agreement: {agree}/{total_valid} ({100*agree/total_valid:.1f}%)")
+                print(f"  [ref debug] per-position target_lp:")
+                for idx in range(total_all):
+                    j_idx = idx // N
+                    off = idx % N
+                    if int(ref_targets[idx]) == -100:
+                        print(f"    j={j_idx} off={off:2d} | [MASKED post-EOS]")
+                        continue
+                    ref_tok = int(ref_targets[idx])
+                    stu_tok = int(student_argmax[idx])
+                    lp_val = float(student_lp[idx, ref_tok])
+                    print(f"    j={j_idx} off={off:2d} | ref_target={repr(tokenizer.decode([ref_tok])):12s} "
+                          f"student_argmax={repr(tokenizer.decode([stu_tok])):12s} | student_lp={lp_val:.4f}"
+                          f"{'  <<<' if ref_tok != stu_tok else ''}")
+
+            loss_ref = F.cross_entropy(
+                ref_student_logits.float() / tau_ref,
+                ref_targets,
+                reduction="mean",
+                ignore_index=-100,
+            ) * 10
+
+            print(f"\nloss_ref = {loss_ref.item():.6f}")
+
+            loss_ref.backward()
+            grad_norm_ref = 0.0
+            grad_norms_per_layer_ref = {}
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    pnorm = p.grad.float().norm().item()
+                    grad_norm_ref += pnorm ** 2
+                    grad_norms_per_layer_ref[name] = pnorm
+            grad_norm_ref = grad_norm_ref ** 0.5
+            print(f"  grad_norm(ref) = {grad_norm_ref:.6f}")
+
+            sorted_layers_ref = sorted(grad_norms_per_layer_ref.items(), key=lambda x: -x[1])[:5]
+            for lname, lnorm in sorted_layers_ref:
+                print(f"    {lname}: {lnorm:.6f}")
+
+            results[attn_mode] = {
+                "loss_consistency": loss_consistency.item(),
+                "loss_ref": loss_ref.item(),
+                "grad_norm_consistency": grad_norm_consistency,
+                "grad_norm_ref": grad_norm_ref,
+            }
+
+        # ----- combined summary -----
+        print(f"\n\n{'='*80}")
+        print(f"SUMMARY (M={M} noised positions, T*N={T*N} ref positions):")
+        for attn_mode in ("same", "cross"):
+            r = results[attn_mode]
+            print(f"  [{attn_mode:5s}] loss_consistency={r['loss_consistency']:.6f}  grad={r['grad_norm_consistency']:.6f}"
+                  f"  |  loss_ref={r['loss_ref']:.6f}  grad={r['grad_norm_ref']:.6f}"
+                  f"  |  ratio={r['grad_norm_ref'] / (r['grad_norm_consistency'] + 1e-12):.4f}")
+
+        model.zero_grad()
         return
         #         with torch.no_grad():
         #             ref_param = next(self.ref_model.parameters())

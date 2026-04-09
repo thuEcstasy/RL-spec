@@ -133,7 +133,7 @@ class CllmTrainer(Trainer):
         """
         Returns [N-1] bool if drop_last_offset else [N] bool.
         True => keep offset t for logits at position (start+t) predicting next token (t+1).
-        We: start computing loss after first divergence.
+        We: start computing loss after first divergence, and stop at EOS.
         """
         device = input_ids.device
         size = N - 1 if drop_last_offset else N
@@ -150,17 +150,22 @@ class CllmTrainer(Trainer):
         else:
             div_keep = torch.zeros(size, dtype=torch.bool, device=device)
 
-        # UNUSED — EOS mask: keep offsets t such that (t+1) is BEFORE EOS in both blocks
-        #def keep_next_before_eos(block):
-        #    if eos_id is None:
-        #        return torch.ones(size, dtype=torch.bool, device=device)
-        #    pos = torch.nonzero(block == eos_id, as_tuple=False)
-        #    if pos.numel() == 0:
-        #        return torch.ones(size, dtype=torch.bool, device=device)
-        #    e = int(pos[0])          # EOS index within [0..N-1]
-        #    return offs < e
-
-        #eos_keep = keep_next_before_eos(k_block) & keep_next_before_eos(l_block)
+        # EOS mask: logits at offset t predict token t+1; if EOS is at offset e
+        # in last_j, then offsets >= e are predicting post-EOS → mask them out
+        eos_ids = set()
+        if eos_id is not None:
+            eos_ids.add(eos_id)
+        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+        if im_end_id is not None:
+            eos_ids.add(im_end_id)
+        if eos_ids:
+            is_eos = torch.zeros(N, dtype=torch.bool, device=device)
+            for eid in eos_ids:
+                is_eos |= (l_block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                div_keep = div_keep & (offs < first_eos)
 
         return div_keep
 
@@ -686,53 +691,75 @@ class CllmTrainer(Trainer):
 
                 ref_targets = ref_logits_all.argmax(dim=-1)   # [T*N]
 
-                # ===== DEBUG: show post-EOS bug =====
+                # Mask out positions at/after EOS in each last_j block
+                eos_ids = set()
+                _eos_id = getattr(self.processing_class, "eos_token_id", None)
+                if _eos_id is not None:
+                    eos_ids.add(_eos_id)
+                _im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+                if _im_end_id is not None:
+                    eos_ids.add(_im_end_id)
+                for j in range(T):
+                    ls = l_starts[j]
+                    block = input_ids[ls:ls + N]
+                    is_eos = torch.zeros(N, dtype=torch.bool, device=input_ids.device)
+                    for eid in eos_ids:
+                        is_eos |= (block == eid)
+                    eos_pos = is_eos.nonzero(as_tuple=False)
+                    if eos_pos.numel() > 0:
+                        first_eos = int(eos_pos[0])
+                        start_idx = j * N + first_eos
+                        end_idx = (j + 1) * N
+                        if start_idx < end_idx:
+                            ref_targets[start_idx:end_idx] = -100
+
+                # ===== DEBUG PRINTING =====
                 if self.args.local_rank == 0:
                     with torch.no_grad():
                         student_lp = F.log_softmax(ref_student_logits.float() / tau_ref, dim=-1)
+                        valid_mask = ref_targets != -100
                         student_argmax = ref_student_logits.argmax(dim=-1)
+
+                        valid_targets = ref_targets[valid_mask]
+                        valid_lp = student_lp[valid_mask]
+                        target_lp = valid_lp[torch.arange(valid_targets.size(0), device=input_ids.device), valid_targets]
+                        valid_argmax = student_argmax[valid_mask]
+                        agree = (valid_argmax == valid_targets).sum().item()
+                        total_valid = valid_targets.size(0)
                         total_all = ref_targets.size(0)
 
-                        # detect EOS positions to flag post-EOS in print
-                        eos_id = getattr(self.processing_class, "eos_token_id", None)
-                        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
-                        eos_cutoffs = {}  # j -> first_eos offset
-                        for j in range(T):
-                            ls = l_starts[j]
-                            block = input_ids[ls:ls + N]
-                            is_eos = torch.zeros(N, dtype=torch.bool, device=input_ids.device)
-                            if eos_id is not None:
-                                is_eos |= (block == eos_id)
-                            if im_end_id is not None:
-                                is_eos |= (block == im_end_id)
-                            epos = is_eos.nonzero(as_tuple=False)
-                            if epos.numel() > 0:
-                                eos_cutoffs[j] = int(epos[0])
-
-                        target_lps = student_lp[torch.arange(total_all, device=input_ids.device), ref_targets]
-                        agree = (student_argmax == ref_targets).sum().item()
-                        print(f"\n  [ref debug] positions: {total_all}, argmax agreement: {agree}/{total_all} ({100*agree/total_all:.1f}%)")
+                        print(f"\n  [ref debug] valid positions: {total_valid}/{total_all} "
+                              f"(masked {total_all - total_valid} post-EOS)")
                         print(f"  [ref debug] student log-prob at ref_target: "
-                              f"mean={target_lps.mean().item():.4f}  min={target_lps.min().item():.4f}  max={target_lps.max().item():.4f}")
+                              f"mean={target_lp.mean().item():.4f}  "
+                              f"min={target_lp.min().item():.4f}  "
+                              f"max={target_lp.max().item():.4f}")
+                        print(f"  [ref debug] argmax agreement: "
+                              f"{agree}/{total_valid} ({100*agree/total_valid:.1f}%)")
                         print(f"  [ref debug] per-position target_lp:", flush=True)
                         for idx in range(total_all):
                             j_idx = idx // N
                             off = idx % N
+                            if int(ref_targets[idx]) == -100:
+                                print(f"    j={j_idx} off={off:2d} | [MASKED post-EOS]")
+                                continue
                             ref_tok = int(ref_targets[idx])
                             stu_tok = int(student_argmax[idx])
-                            lp_val = float(target_lps[idx])
-                            is_post_eos = j_idx in eos_cutoffs and off >= eos_cutoffs[j_idx]
-                            flag = "  <<< POST-EOS (not masked!)" if is_post_eos else ("  <<<" if ref_tok != stu_tok else "")
+                            lp_val = float(student_lp[idx, ref_tok])
                             print(f"    j={j_idx} off={off:2d} | "
                                   f"ref_target={repr(self.processing_class.decode([ref_tok])):12s} "
                                   f"student_argmax={repr(self.processing_class.decode([stu_tok])):12s} "
-                                  f"| student_lp={lp_val:.4f}{flag}")
-                # ===== END DEBUG =====
+                                  f"| student_lp={lp_val:.4f}"
+                                  f"{'  <<<' if ref_tok != stu_tok else ''}")
+                # ===== DEBUG PRINTING =====
 
+
+        
                 loss_ref = F.cross_entropy(
                     ref_student_logits.float() / tau_ref,
                     ref_targets,
                     reduction="mean",
+                    ignore_index=-100,
                 )
             else:
                 loss_ref = torch.zeros((), device=self.args.device)

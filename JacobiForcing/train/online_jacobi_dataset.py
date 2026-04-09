@@ -247,13 +247,17 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         accept_blocks: List[torch.Tensor] = []
         itr_list: List[int] = []
         
+        stop_reason = "unknown"
         while True:
             generated_part = generated_ids[:, prompt_len:]
             if self._hit_eos(generated_part[0]):
+                stop_reason = f"hit_eos (total_new_tokens={total_new_tokens})"
                 break
             if total_new_tokens >= max_new_tokens:
+                stop_reason = f"max_new_tokens ({max_new_tokens})"
                 break
             if calls >= max_calls:
+                stop_reason = f"max_calls ({max_calls})"
                 break
 
             if prefill_phase:
@@ -307,9 +311,9 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
                 capture_noisy_block=True,
                 capture_len=self.noise_schedule[self.global_idx % len(self.noise_schedule)], # TODO: maybe tune this
             )
-            print("capture len =", self.noise_schedule[self.global_idx % len(self.noise_schedule)], flush=True)
             self.global_idx += 1
             if accepted_n_gram is None or accepted_n_gram.numel() == 0:
+                stop_reason = f"accepted_n_gram empty (calls={calls}, total_new_tokens={total_new_tokens})"
                 break
 
             generated_ids = torch.cat((generated_ids, accepted_n_gram), dim=-1)
@@ -321,7 +325,8 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
             traj_position_indices.append(total_new_tokens)
             calls += 1
         tokens_per_iter = total_new_tokens / sum(itr_list) if itr_list and total_new_tokens > 0 else None
-        print("finished rollout! total_new_tokens =", total_new_tokens, "tokens/iter = ", tokens_per_iter, flush=True)
+        print(f"finished rollout! total_new_tokens={total_new_tokens}, tokens/iter={tokens_per_iter}, "
+              f"calls={calls}, blocks={len(draft_blocks)}, stop_reason={stop_reason}", flush=True)
         return {
             "prompt_ids": prompt_ids,
             "prompt_ids_len": prompt_len,
