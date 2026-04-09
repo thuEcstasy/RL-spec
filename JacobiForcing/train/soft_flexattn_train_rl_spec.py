@@ -23,7 +23,7 @@ from pathlib import Path
 path_root = Path(__file__).parents[0]
 sys.path.append(str(path_root))
 
-from soft_flexattn_cllm_trainer_multiblock import CllmTrainer
+from soft_flexattn_cllm_trainer_multiblock_v1 import CllmTrainer
 from online_jacobi_dataset import (
     PromptOnlyDataset,
     OnlineJacobiTrajectoryDataset,

@@ -686,49 +686,6 @@ class CllmTrainer(Trainer):
 
                 ref_targets = ref_logits_all.argmax(dim=-1)   # [T*N]
 
-                # ===== DEBUG: show post-EOS bug =====
-                if self.args.local_rank == 0:
-                    with torch.no_grad():
-                        student_lp = F.log_softmax(ref_student_logits.float() / tau_ref, dim=-1)
-                        student_argmax = ref_student_logits.argmax(dim=-1)
-                        total_all = ref_targets.size(0)
-
-                        # detect EOS positions to flag post-EOS in print
-                        eos_id = getattr(self.processing_class, "eos_token_id", None)
-                        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
-                        eos_cutoffs = {}  # j -> first_eos offset
-                        for j in range(T):
-                            ls = l_starts[j]
-                            block = input_ids[ls:ls + N]
-                            is_eos = torch.zeros(N, dtype=torch.bool, device=input_ids.device)
-                            if eos_id is not None:
-                                is_eos |= (block == eos_id)
-                            if im_end_id is not None:
-                                is_eos |= (block == im_end_id)
-                            epos = is_eos.nonzero(as_tuple=False)
-                            if epos.numel() > 0:
-                                eos_cutoffs[j] = int(epos[0])
-
-                        target_lps = student_lp[torch.arange(total_all, device=input_ids.device), ref_targets]
-                        agree = (student_argmax == ref_targets).sum().item()
-                        print(f"\n  [ref debug] positions: {total_all}, argmax agreement: {agree}/{total_all} ({100*agree/total_all:.1f}%)")
-                        print(f"  [ref debug] student log-prob at ref_target: "
-                              f"mean={target_lps.mean().item():.4f}  min={target_lps.min().item():.4f}  max={target_lps.max().item():.4f}")
-                        print(f"  [ref debug] per-position target_lp:", flush=True)
-                        for idx in range(total_all):
-                            j_idx = idx // N
-                            off = idx % N
-                            ref_tok = int(ref_targets[idx])
-                            stu_tok = int(student_argmax[idx])
-                            lp_val = float(target_lps[idx])
-                            is_post_eos = j_idx in eos_cutoffs and off >= eos_cutoffs[j_idx]
-                            flag = "  <<< POST-EOS (not masked!)" if is_post_eos else ("  <<<" if ref_tok != stu_tok else "")
-                            print(f"    j={j_idx} off={off:2d} | "
-                                  f"ref_target={repr(self.processing_class.decode([ref_tok])):12s} "
-                                  f"student_argmax={repr(self.processing_class.decode([stu_tok])):12s} "
-                                  f"| student_lp={lp_val:.4f}{flag}")
-                # ===== END DEBUG =====
-
                 loss_ref = F.cross_entropy(
                     ref_student_logits.float() / tau_ref,
                     ref_targets,

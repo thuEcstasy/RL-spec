@@ -169,6 +169,71 @@ class CllmTrainer(Trainer):
 
         return div_keep
 
+    def _block_position_weights(
+        self,
+        input_ids: torch.Tensor,
+        k_start: int,
+        l_start: int,
+        N: int,
+        eos_id: int | None,
+        correct_weight: float = 0.9,
+        diverge_weight: float = 1.0,
+        min_weight: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Per-position float weights [N] for a (k_j, last_j) block pair.
+
+        Weight schedule:
+          - correct positions (k==last, before first diverge): correct_weight
+          - first diverge position:                            diverge_weight (max)
+          - after first diverge:     linear decay diverge_weight → min_weight
+          - at / after EOS in last_j:                          0.0
+        """
+        device = input_ids.device
+        k_block = input_ids[k_start : k_start + N]
+        l_block = input_ids[l_start : l_start + N]
+
+        weights = torch.zeros(N, dtype=torch.float32, device=device)
+
+        diff = (k_block != l_block)
+        if diff.any():
+            first_diff = int(torch.nonzero(diff, as_tuple=False)[0])
+        else:
+            # fully converged block: every position keeps correct_weight
+            weights[:] = correct_weight
+            first_diff = N  # sentinel
+
+        if first_diff < N:
+            # correct prefix
+            if first_diff > 0:
+                weights[:first_diff] = correct_weight
+            # first divergence
+            weights[first_diff] = diverge_weight
+            # linear decay for the rest
+            remaining = N - first_diff - 1
+            if remaining > 0:
+                weights[first_diff + 1 :] = torch.linspace(
+                    diverge_weight, min_weight, remaining + 1, device=device
+                )[1:]
+
+        # EOS masking: zero out at / after first EOS in last_j
+        eos_ids = set()
+        if eos_id is not None:
+            eos_ids.add(eos_id)
+        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+        if im_end_id is not None:
+            eos_ids.add(im_end_id)
+        if eos_ids:
+            is_eos = torch.zeros(N, dtype=torch.bool, device=device)
+            for eid in eos_ids:
+                is_eos |= (l_block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                weights[first_eos:] = 0.0
+
+        return weights
+
     @staticmethod
     def _index_layout(prompt_len: int, T: int, N):
         """Return lists of start indices for all k_j and last_j blocks in flattened sequence."""
@@ -228,6 +293,22 @@ class CllmTrainer(Trainer):
         entropy = entropy.masked_fill(expand_mask, 0)
         mean_entropy = entropy.sum() / (~padding_mask).sum()
         return mean_entropy
+
+    def weighted_soft_cross_entropy(self, predicts, targets, weights):
+        """
+        Weighted soft cross-entropy.
+        predicts: [K, V] raw logits
+        targets:  [K, V] raw logits (will be softmaxed)
+        weights:  [K]    per-position weights (>0 for active positions)
+        """
+        active = weights > 0
+        if active.sum() == 0:
+            return 0 * predicts[0][0]
+        predict_log_prob = F.log_softmax(predicts, dim=-1)
+        targets_prob = F.softmax(targets, dim=-1)
+        per_token_loss = -(targets_prob * predict_log_prob).sum(dim=-1)  # [K]
+        weighted_loss = (per_token_loss * weights).sum() / weights.sum()
+        return weighted_loss
 
     # FlexAttention BlockMask
     # - prompt queries: causal within prompt
@@ -577,25 +658,31 @@ class CllmTrainer(Trainer):
             ) * 10
 
         # =========================================================
-        # Consistency loss (原逻辑保留)
+        # Consistency loss — weighted by divergence position
         # =========================================================
         T_soft = getattr(self.args, "distill_temperature", 1.0)
 
-        drop_last_offset = False
-        offs = torch.arange(N - 1 if drop_last_offset else N, device=self.args.device)
+        # Weighting hyperparams (can be moved to args if needed)
+        correct_weight = getattr(self.args, "consistency_correct_weight", 0.9)
+        diverge_weight = getattr(self.args, "consistency_diverge_weight", 1.0)
+        min_weight     = getattr(self.args, "consistency_min_weight", 0.1)
 
-        student_positions, teacher_positions = [], []
+        offs = torch.arange(N, device=self.args.device)
+
+        student_positions, teacher_positions, position_weights = [], [], []
         for j in range(T):
             ks, ls = k_starts[j], l_starts[j]
-            pair_keep = self._block_keep_mask_divergence_and_eos(
-                input_ids, ks, ls, N, eos_id=eos_id, drop_last_offset=drop_last_offset
+            w_j = self._block_position_weights(
+                input_ids, ks, ls, N, eos_id=eos_id,
+                correct_weight=correct_weight,
+                diverge_weight=diverge_weight,
+                min_weight=min_weight,
             )
-            if pair_keep.any():
-                sp = ks + offs[pair_keep]   # noisy k_j positions
-                tp = ls + offs[pair_keep]   # clean last_j positions
-                student_positions.append(sp)
-                teacher_positions.append(tp)
-
+            active = w_j > 0
+            if active.any():
+                student_positions.append(ks + offs[active])
+                teacher_positions.append(ls + offs[active])
+                position_weights.append(w_j[active])
 
         if len(student_positions) == 0:
             zero = logits.sum() * 0.0
@@ -604,42 +691,15 @@ class CllmTrainer(Trainer):
         else:
             sp = torch.cat(student_positions, dim=0)  # [K]
             tp = torch.cat(teacher_positions, dim=0)  # [K]
+            pw = torch.cat(position_weights, dim=0)   # [K]
 
-            # global [L] padding mask: PADs and duplicate k_j prefixes
-            global_pad_and_dup_mask = self._build_padding_mask_for_loss(input_ids, prompt_len, T)
+            student_logits_all = logits[0, sp, :] / T_soft
+            teacher_logits_all = logits[0, tp, :].detach() / T_soft
 
-            # per-pair padding mask (True = mask out)
-            padding_mask = global_pad_and_dup_mask.index_select(0, sp)
-
-            # ---------- student noisy logits ----------
-            student_logits_all = logits[0, sp, :]   # [K, V]
-
-            # ---------- original self-distill consistency ----------
-            teacher_logits_all = logits[0, tp, :].detach()
-
-            student_logits_temp = student_logits_all / T_soft
-            teacher_logits_temp = teacher_logits_all / T_soft
-
-            # [DEBUG] print some of their probs to check for collapse
-            # if self.args.local_rank == 0:
-            #     with torch.no_grad():
-            #         print(
-            #             f"===== sample teacher probs for first 5 pairs =====\n"
-            #             f"{teacher_logits_temp[:16][:100]}\n==========\n",
-            #             flush=True,
-            #         )
-            #         print(
-            #             f"===== sample student probs for first 5 pairs =====\n"
-            #             f"{student_logits_temp[:16][:100]}\n==========\n",
-            #             flush=True,
-            #         )
-            #         print(logits[0, prompt_len + 1, :10])
-            #         print(logits[0, prompt_len + N + 1, :10])
-
-            loss_consistency = self.soft_cross_entropy(
-                student_logits_temp.float(),
-                teacher_logits_temp.float(),
-                padding_mask
+            loss_consistency = self.weighted_soft_cross_entropy(
+                student_logits_all.float(),
+                teacher_logits_all.float(),
+                pw,
             )
             loss_consistency = loss_consistency * (T_soft * T_soft) / T
 
