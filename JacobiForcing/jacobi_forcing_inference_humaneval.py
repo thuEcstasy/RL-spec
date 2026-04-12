@@ -35,7 +35,8 @@ records = df.to_dict(orient="records")
 # Load model/tokenizer once
 # ---------------------------
 # model_name = "/home/szf/huggingface/JacobiForcing_Coder_7B_v1"
-model_name = "/mnt/szf_temp/huggingface/JacobiForcing_Coder_7B_v1"
+# model_name = "/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_v3_n16_fix_rollout_model/checkpoint-2000"
+model_name = "/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_v3_n16_m5/checkpoint-2000"
 
 model = Qwen2ForCausalLM.from_pretrained(
     model_name,
@@ -43,7 +44,7 @@ model = Qwen2ForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
 )
-tokenizer = AutoTokenizer.from_pretrained("/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("/mnt/szf_temp/huggingface/Qwen2.5-Coder-3B-Instruct")
 model.eval()
 
 

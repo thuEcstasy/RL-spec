@@ -17,6 +17,9 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
+from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved_v3 import (
+    jacobi_forward_greedy as jacobi_forward_greedy_v3,
+)
 
 
 
@@ -45,6 +48,14 @@ class OnlineJacobiConfig:
 
     # 为了避免 dataloader worker 进程里碰 GPU，online sampling 必须单进程
     require_num_workers_zero: bool = True
+
+    # Multi-noisy mode (for v3 trainer):
+    # When set to a non-empty list, each Jacobi trajectory position j produces m = len(capture_lens)
+    # noisy snapshots k_j^1..k_j^m (captured when accepted tokens first cross each target), all
+    # paired with the same clean block last_j. The resulting layout is:
+    #     [prompt, k_0^1, ..., k_0^m, last_0, k_1^1, ..., k_1^m, last_1, ...]
+    # When None / empty, falls back to the legacy single-noisy behavior.
+    capture_lens: Optional[List[int]] = None
 
 
 class PromptOnlyDataset(torch.utils.data.Dataset):
@@ -174,8 +185,15 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
     def set_rollout_model(self, rollout_model):
         self.rollout_model = rollout_model
 
-        if not hasattr(self.rollout_model.__class__, "jacobi_forward_greedy"):
-            self.rollout_model.__class__.jacobi_forward_greedy = jacobi_forward_greedy
+        # In multi-noisy mode, attach the v3 jacobi_forward_greedy (which supports
+        # `capture_lens` and returns a list of noisy records). Otherwise keep the
+        # legacy single-noisy version so v1/v2 trainers stay unaffected.
+        fwd = (
+            jacobi_forward_greedy_v3
+            if (self.cfg.capture_lens is not None and len(self.cfg.capture_lens) > 0)
+            else jacobi_forward_greedy
+        )
+        self.rollout_model.__class__.jacobi_forward_greedy = fwd
 
     def set_distributed(self, rank: int, world_size: int):
         self.rank = rank
@@ -243,9 +261,14 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         total_new_tokens = 0
         calls = 0
         traj_position_indices: List[int] = []
-        draft_blocks: List[torch.Tensor] = []
+        # In single-noisy mode, draft_blocks[j] is a tensor.
+        # In multi-noisy mode, draft_blocks[j] is a list[Tensor] of length m (one per capture target).
+        draft_blocks: List[Any] = []
         accept_blocks: List[torch.Tensor] = []
         itr_list: List[int] = []
+
+        multi_capture_lens = self.cfg.capture_lens
+        multi_noisy_mode = bool(multi_capture_lens) and len(multi_capture_lens) > 0
         
         stop_reason = "unknown"
         while True:
@@ -298,19 +321,34 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
             accepted_history_ids = generated_ids[:, prompt_len:]
 
-            past_key_values, first_correct_token, accepted_n_gram, itr, noisy_block_record = model.jacobi_forward_greedy(
-                input_ids=step_input_ids,
-                attention_mask=None,
-                past_key_values=past_key_values,
-                use_cache=True,
-                prefill_phase=False,
-                n_token_seq_len=n_token_seq_len,
-                tokenizer=self.tokenizer,
-                accepted_history_ids=accepted_history_ids,
-                eos_token_id=self.tokenizer.eos_token_id,
-                capture_noisy_block=True,
-                capture_len=self.noise_schedule[self.global_idx % len(self.noise_schedule)], # TODO: maybe tune this
-            )
+            if multi_noisy_mode:
+                past_key_values, first_correct_token, accepted_n_gram, itr, noisy_records = model.jacobi_forward_greedy(
+                    input_ids=step_input_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    prefill_phase=False,
+                    n_token_seq_len=n_token_seq_len,
+                    tokenizer=self.tokenizer,
+                    accepted_history_ids=accepted_history_ids,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    capture_noisy_block=True,
+                    capture_lens=list(multi_capture_lens),
+                )
+            else:
+                past_key_values, first_correct_token, accepted_n_gram, itr, noisy_record = model.jacobi_forward_greedy(
+                    input_ids=step_input_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    prefill_phase=False,
+                    n_token_seq_len=n_token_seq_len,
+                    tokenizer=self.tokenizer,
+                    accepted_history_ids=accepted_history_ids,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    capture_noisy_block=True,
+                    capture_len=self.noise_schedule[self.global_idx % len(self.noise_schedule)], # TODO: maybe tune this
+                )
             self.global_idx += 1
             if accepted_n_gram is None or accepted_n_gram.numel() == 0:
                 stop_reason = f"accepted_n_gram empty (calls={calls}, total_new_tokens={total_new_tokens})"
@@ -318,9 +356,17 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
             generated_ids = torch.cat((generated_ids, accepted_n_gram), dim=-1)
             itr_list.append(itr)
-            if noisy_block_record is not None:
-                draft_blocks.append(noisy_block_record["noisy_block"].clone())         # full noisy block
-                accept_blocks.append(accepted_n_gram.clone())   
+            if multi_noisy_mode:
+                # Only keep trajectory positions where ALL m capture targets were reached.
+                # Since capture_lens is typically monotonically increasing, the last one is
+                # the most constraining; still, verify every slot to be safe.
+                if all(rec is not None for rec in noisy_records):
+                    draft_blocks.append([rec["noisy_block"].clone() for rec in noisy_records])
+                    accept_blocks.append(accepted_n_gram.clone())
+            else:
+                if noisy_record is not None:
+                    draft_blocks.append(noisy_record["noisy_block"].clone())         # full noisy block
+                    accept_blocks.append(accepted_n_gram.clone())
             total_new_tokens = generated_ids.shape[1] - prompt_len
             traj_position_indices.append(total_new_tokens)
             calls += 1
@@ -342,7 +388,7 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
 
         prompt_ids_2d = rollout["prompt_ids"]          # [1, P]
         prompt_len = rollout["prompt_ids_len"]
-        draft_blocks = rollout["draft_blocks"]         # list of [1, N]
+        draft_blocks = rollout["draft_blocks"]
         accept_blocks = rollout["accept_blocks"]       # list of [1, capture_len]
 
         N = self.cfg.n_token_seq_len
@@ -353,11 +399,22 @@ class OnlineJacobiTrajectoryDataset(IterableDataset):
         seq_parts = [prompt_ids_2d.squeeze(0)]
 
         T = min(len(draft_blocks), len(accept_blocks))
-        for j in range(T):
-            k_j = _pad_or_truncate_block(draft_blocks[j], N, pad_id).squeeze(0)
-            l_j = _pad_or_truncate_block(accept_blocks[j], N, pad_id).squeeze(0)
-            seq_parts.append(k_j)
-            seq_parts.append(l_j)
+        multi_noisy_mode = bool(self.cfg.capture_lens) and len(self.cfg.capture_lens) > 0
+        if multi_noisy_mode:
+            # Layout: [prompt, k_0^1, ..., k_0^m, last_0, k_1^1, ..., k_1^m, last_1, ...]
+            for j in range(T):
+                noisy_list = draft_blocks[j]  # list of m tensors, each [1, N]
+                for k_i in noisy_list:
+                    seq_parts.append(_pad_or_truncate_block(k_i, N, pad_id).squeeze(0))
+                l_j = _pad_or_truncate_block(accept_blocks[j], N, pad_id).squeeze(0)
+                seq_parts.append(l_j)
+        else:
+            # Legacy layout: [prompt, k_0, last_0, k_1, last_1, ...]
+            for j in range(T):
+                k_j = _pad_or_truncate_block(draft_blocks[j], N, pad_id).squeeze(0)
+                l_j = _pad_or_truncate_block(accept_blocks[j], N, pad_id).squeeze(0)
+                seq_parts.append(k_j)
+                seq_parts.append(l_j)
 
         input_ids = torch.cat(seq_parts, dim=0).cpu()
 

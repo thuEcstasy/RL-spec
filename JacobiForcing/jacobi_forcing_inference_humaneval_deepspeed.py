@@ -19,7 +19,7 @@ import sys
 path_root = Path(__file__).parents[1]
 sys.path.append(str(path_root))
 
-from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved import jacobi_forward_greedy
+from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved_v4 import jacobi_forward_greedy
 Qwen2ForCausalLM.jacobi_forward_greedy = jacobi_forward_greedy
 
 # Load dataset
@@ -42,27 +42,34 @@ records = df.to_dict(orient="records")
 # )
 # tokenizer = AutoTokenizer.from_pretrained("/home/szf/huggingface/Qwen2.5-Coder-7B-Instruct")
 
-from safetensors.torch import load_file
 import glob
 
-checkpoint_path = "/workspace/Zhaofeng/output/checkpoint-5000"
-base_model_name = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-7B-Instruct"
+checkpoint_path = "/mnt/szf_temp/JacobiForcing/JacobiForcing/outputs/rl_spec_v3_n16_fix_rollout_model/checkpoint-2000"
+base_model_name = "/mnt/szf_temp/huggingface/Qwen2.5-Coder-3B-Instruct"
 
-# 1) 用 base model 正确初始化（保证 attn_implementation、内部状态等全部正确）
+# 1) 用 base model 正确初始化（v4 需要 flex_attention 以支持双向 draft block）
 model = Qwen2ForCausalLM.from_pretrained(
     base_model_name,
     device_map="cpu",
     torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2"
+    attn_implementation="flex_attention",
 )
 
-# 2) 从 deepspeed checkpoint 加载权重，strip "module." prefix
-shard_paths = sorted(glob.glob(os.path.join(checkpoint_path, "model-*-of-*.safetensors")))
+# 2) 从 deepspeed checkpoint 加载权重（pytorch bin 格式），strip "module." prefix
+shard_paths = sorted(glob.glob(os.path.join(checkpoint_path, "pytorch_model-*-of-*.bin")))
+if not shard_paths:
+    single = os.path.join(checkpoint_path, "pytorch_model.bin")
+    if os.path.exists(single):
+        shard_paths = [single]
+if not shard_paths:
+    raise FileNotFoundError(f"No pytorch_model*.bin found under {checkpoint_path}")
+
 clean_state_dict = {}
 for path in shard_paths:
-    shard = load_file(path, device="cpu")
+    shard = torch.load(path, map_location="cpu", weights_only=True)
     for k, v in shard.items():
         clean_state_dict[k.removeprefix("module.")] = v.to(torch.bfloat16)
+    del shard
 
 missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
 print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
@@ -85,7 +92,7 @@ alt_eos_id = 151645  # keep your special EOS as a fallback
 n_token_seq_len = 64
 
 # Safety caps so a sample can't run forever.
-max_new_tokens = 32768     # hard cap on total new tokens per prompt
+max_new_tokens = 1024     # hard cap on total new tokens per prompt
 max_calls = 1024          # hard cap on number of diffusion_decoding calls per prompt
 
 # ---------------------------
@@ -281,7 +288,7 @@ def extract_python_code(text):
     else:
         return text  # Return orginal one if no match is found
 
-eval_dir = "/home/szf/JacobiForcing/eval/CLLM2_eval_generations/baselines"
+eval_dir = "/mnt/szf_temp/RL-spec/eval/CLLM2_eval_generations/baselines"
 os.makedirs(eval_dir, exist_ok=True)
 
 original_path = os.path.join(eval_dir, 'humaneval_python_example_clean.jsonl')
@@ -296,7 +303,7 @@ for i, original_generation in enumerate(original_generations):
     original_generation['generation'] = processed_generation
 
 # Save processed generations
-save_path = os.path.join(eval_dir, f'{n_token_seq_len}oct_n16w16_distilln32w16_212kstps_greedy_code_only_prompt_humaneval_w_kv_generation_{model_name.split("/")[-1]}.jsonl')
+save_path = os.path.join(eval_dir, f'{n_token_seq_len}oct_n16w16_distilln32w16_212kstps_greedy_code_only_prompt_humaneval_w_kv_generation_{base_model_name.split("/")[-1]}.jsonl')
 save_jsonl(original_generations, save_path)
 
 print(f"\n=== All generation done (HumanEval). Results are saved to {save_path} ===")

@@ -1,3 +1,11 @@
+v1: use padded for ref loss
+
+v2: use noise amplifier for better training
+
+v3: try sampling multiple noise blocks in a block (Dflash, Your LLM knows the future)
+
+v4: use bi-directional attention within the draft block to further improve the quality of the draft and reduce the training difficulty of the model to learn to handle noisy blocks, which is the main source of quality drop for Jacobi Forcing models. The new attention mask implementation is in `modeling/cllm2_qwen2_modeling_kv_terminate_on_eos_improved_v4.py`.
+
 <p align="center">
   <img src="assets/jacobi_forcing_logo.jpeg" alt="Jacobi Forcing" width="180" align="center">
 </p>

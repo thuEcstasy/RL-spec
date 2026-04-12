@@ -1,0 +1,1051 @@
+import torch
+import wandb
+import random
+import time
+from torch.cuda.amp import autocast
+from transformers import Trainer
+from transformers.trainer_pt_utils import LabelSmoother
+
+import torch.nn.functional as F
+
+from torch.nn.attention.flex_attention import create_block_mask
+
+from functools import lru_cache
+
+import torch.distributed as dist
+import deepspeed
+
+IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+
+class CllmTrainer(Trainer):
+    def __init__(self, *args,  accelerator=None, optimizer=None, lr_scheduler=None, train_dataloader=None, ref_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        args = kwargs["args"]
+
+        self.accelerator = accelerator
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.train_dataloader = train_dataloader
+
+        self.base_model = self.accelerator.unwrap_model(self.model)
+        
+        # ref model
+        self.ref_model = ref_model
+        if self.ref_model is not None:
+            self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad_(False)
+        
+        self.cfg = self.base_model.config
+
+        self.train_step_cnt = 0
+
+        self.max_new_tokens = args.max_new_tokens
+        self.use_gt_labels = args.use_gt_labels
+        # cache BlockMasks keyed by (L, prompt_len, T, heads, version)
+        self._blockmask_cache = {}
+
+    # Utilities
+    @staticmethod
+    def _to_int(x):
+        return x.item() if isinstance(x, torch.Tensor) else int(x)
+
+    def get_train_dataloader(self):
+        return self.train_dataloader
+
+    def _unpack_sample(self, inputs):
+        """
+        Extract a single sample. (Assumes per_device_train_batch_size == 1.)
+        Required keys:
+          - input_ids: [1, L]
+          - prompt_ids_len: scalar or [1]
+          - T: length of traj_position_indices (last uncorrupted token positions) in [1, T]
+        """
+        # TODO: support bsz > 1 uppacking
+        input_ids = inputs["input_ids"]
+        prompt_len = inputs["prompt_ids_len"]
+        prompt_len = self._to_int(prompt_len)
+
+        traj_position_indices = inputs["traj_position_indices"][0]
+        traj_position_indices = [int(u) for u in traj_position_indices]
+        T = len(traj_position_indices)
+
+        return (
+            input_ids.to(self.args.device),
+            prompt_len,
+            T,
+        )
+    
+    def _duplicate_prefix_mask(self, input_ids: torch.Tensor, prompt_len: int, T: int) -> torch.Tensor:
+        """
+        [L] bool: True where token should be masked because it's in k_j^i's prefix
+        identical to last_j (from left to right until first divergence).
+        Only noisy (k_j^i) tokens are masked; last_j tokens are not.
+        """
+        device = input_ids.device
+        N = self.max_new_tokens
+        L = input_ids.size(0)
+        mask = torch.zeros(L, dtype=torch.bool, device=device)
+
+        k_starts, l_starts = self._index_layout(prompt_len, T, N)
+        for j in range(T):
+            ls = l_starts[j]
+            l_block = input_ids[ls:ls + N]
+            for ks in k_starts[j]:
+                k_block = input_ids[ks:ks + N]
+                eq = (k_block == l_block)
+                if torch.any(~eq):
+                    first_diff = int(torch.nonzero(~eq, as_tuple=False)[0])
+                else:
+                    first_diff = N
+                if first_diff > 0:
+                    mask[ks:ks + first_diff] = True
+
+        return mask
+
+    def _build_padding_mask_for_loss(self, input_ids: torch.Tensor, prompt_len: int, T: int) -> torch.Tensor:
+        """
+        [L] bool padding mask used for losses:
+        True = mask, False = keep.
+        Combines: (a) PAD tokens, (b) duplicate-prefix in each k_j vs last_j.
+        """
+        device = input_ids.device
+        pad_id = getattr(self.processing_class, "pad_token_id", None)
+
+        mask = torch.zeros_like(input_ids, dtype=torch.bool, device=device)
+        if pad_id is not None:
+            mask |= (input_ids == pad_id)
+
+        mask |= self._duplicate_prefix_mask(input_ids, prompt_len, T)
+        return mask
+
+    def _block_keep_mask_divergence_and_eos(
+        self,
+        input_ids: torch.Tensor,
+        k_start: int,
+        l_start: int,
+        N: int,
+        eos_id: int | None,
+        drop_last_offset: bool = False,
+    ) -> torch.Tensor:
+        """
+        Returns [N-1] bool if drop_last_offset else [N] bool.
+        True => keep offset t for logits at position (start+t) predicting next token (t+1).
+        We: start computing loss after first divergence, and stop at EOS.
+        """
+        device = input_ids.device
+        size = N - 1 if drop_last_offset else N
+        offs = torch.arange(size, device=device)
+
+        k_block = input_ids[k_start : k_start + N]
+        l_block = input_ids[l_start : l_start + N]
+
+        # Divergence mask (pairwise): keep from first differing offset onward
+        diff = (k_block[:size] != l_block[:size])
+        if diff.any():
+            first_diff = int(torch.nonzero(diff, as_tuple=False)[0])
+            div_keep = offs >= first_diff
+        else:
+            div_keep = torch.zeros(size, dtype=torch.bool, device=device)
+
+        # EOS mask: logits at offset t predict token t+1; if EOS is at offset e
+        # in last_j, then offsets >= e are predicting post-EOS → mask them out
+        eos_ids = set()
+        if eos_id is not None:
+            eos_ids.add(eos_id)
+        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+        if im_end_id is not None:
+            eos_ids.add(im_end_id)
+        if eos_ids:
+            is_eos = torch.zeros(N, dtype=torch.bool, device=device)
+            for eid in eos_ids:
+                is_eos |= (l_block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                div_keep = div_keep & (offs < first_eos)
+
+        return div_keep
+
+    def _block_position_weights(
+        self,
+        input_ids: torch.Tensor,
+        k_start: int,
+        l_start: int,
+        N: int,
+        eos_id: int | None,
+        correct_weight: float = 0.9,
+        diverge_weight: float = 1.0,
+        min_weight: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Per-position float weights [N] for a (k_j, last_j) block pair.
+
+        Weight schedule:
+          - correct positions (k==last, before first diverge): correct_weight
+          - first diverge position:                            diverge_weight (max)
+          - after first diverge:     linear decay diverge_weight → min_weight
+          - at / after EOS in last_j:                          0.0
+        """
+        device = input_ids.device
+        k_block = input_ids[k_start : k_start + N]
+        l_block = input_ids[l_start : l_start + N]
+
+        weights = torch.zeros(N, dtype=torch.float32, device=device)
+
+        diff = (k_block != l_block)
+        if diff.any():
+            first_diff = int(torch.nonzero(diff, as_tuple=False)[0])
+        else:
+            # fully converged block: every position keeps correct_weight
+            weights[:] = correct_weight
+            first_diff = N  # sentinel
+
+        if first_diff < N:
+            # correct prefix
+            if first_diff > 0:
+                weights[:first_diff] = correct_weight
+            # first divergence
+            weights[first_diff] = diverge_weight
+            # linear decay for the rest
+            remaining = N - first_diff - 1
+            if remaining > 0:
+                weights[first_diff + 1 :] = torch.linspace(
+                    diverge_weight, min_weight, remaining + 1, device=device
+                )[1:]
+
+        # EOS masking: zero out at / after first EOS in last_j
+        eos_ids = set()
+        if eos_id is not None:
+            eos_ids.add(eos_id)
+        im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+        if im_end_id is not None:
+            eos_ids.add(im_end_id)
+        if eos_ids:
+            is_eos = torch.zeros(N, dtype=torch.bool, device=device)
+            for eid in eos_ids:
+                is_eos |= (l_block == eid)
+            eos_pos = is_eos.nonzero(as_tuple=False)
+            if eos_pos.numel() > 0:
+                first_eos = int(eos_pos[0])
+                weights[first_eos:] = 0.0
+
+        return weights
+
+    def _get_m_noisy(self) -> int:
+        """Number of noisy blocks per trajectory position.
+
+        Multi-noisy mode is driven by the dataset's capture_lens; in single mode m=1
+        and the layout degenerates back to the old [k_j, last_j] pairing.
+        """
+        ds = getattr(self, "rollout_dataset", None)
+        if ds is not None:
+            cfg = getattr(ds, "cfg", None)
+            if cfg is not None:
+                capture_lens = getattr(cfg, "capture_lens", None)
+                if capture_lens is not None and len(capture_lens) > 0:
+                    return len(capture_lens)
+        return 1
+
+    def _index_layout(self, prompt_len: int, T: int, N):
+        """Return start indices for noisy/clean blocks in the flattened sequence.
+
+        Layout: [prompt, k_0^1, ..., k_0^m, last_0, k_1^1, ..., k_1^m, last_1, ...]
+        Returns:
+            k_starts: List[List[int]], k_starts[j][i] is the start of the i-th noisy block at traj pos j (0 <= i < m)
+            l_starts: List[int],       l_starts[j]    is the start of the clean last_j block
+        """
+        m = self._get_m_noisy()
+        G = (m + 1) * N  # block-group stride: m noisy slots + 1 clean slot
+        k_starts = [[prompt_len + j * G + i * N for i in range(m)] for j in range(T)]
+        l_starts = [prompt_len + j * G + m * N for j in range(T)]
+        return k_starts, l_starts
+
+    def _build_shared_position_ids(self, L: int, prompt_len: int, T: int):
+        """
+        Build [L] position_ids so every slot in group j (the m noisy blocks k_j^1..k_j^m
+        and the clean block last_j) shares the same positions.
+        Prompt: 0...prompt_len-1
+        For each j: all m+1 slots use prompt_len + j*N .. prompt_len + j*N + (N-1)
+        """
+        device = self.args.device
+        N = self.max_new_tokens
+        m = self._get_m_noisy()
+        G = (m + 1) * N
+        pos = torch.empty(L, dtype=torch.long, device=device)
+
+        # Prompt positions
+        pos[:prompt_len] = torch.arange(prompt_len, device=device)
+
+        rel = torch.arange(N, device=device)
+        for j in range(T):
+            base_pos = prompt_len + j * N  # shared "clean" position for block group j
+            group_start = prompt_len + j * G
+            for slot in range(m + 1):
+                s = group_start + slot * N
+                pos[s:s + N] = base_pos + rel
+
+        return pos
+    
+    def _flip_block_after_eos_to_pad(self, input_ids: torch.Tensor, start: int, N: int, eos_id: int | None, pad_id: int | None) -> int:
+        """Mutate input_ids[start:start+N] so that tokens AFTER first EOS become PAD.
+        Returns number of tokens flipped."""
+        if eos_id is None or pad_id is None:
+            return 0
+        block = input_ids[start:start+N]
+        pos = (block == eos_id).nonzero(as_tuple=False)
+        if pos.numel() == 0:
+            return 0
+        k = int(pos[0])                  # eos offset inside block
+        flip_start = start + k + 1
+        flip_end   = start + N
+        if flip_start < flip_end:
+            input_ids[flip_start:flip_end] = pad_id
+            return flip_end - flip_start
+        return 0
+    
+    def soft_cross_entropy(self, predicts, targets, padding_mask):
+        if (~padding_mask).sum() == 0:
+            return 0 * predicts[0][0]
+        predict_log_prob = torch.nn.functional.log_softmax(predicts, dim=-1)
+        targets_prob = torch.nn.functional.softmax(targets, dim=-1)
+        entropy = -targets_prob * predict_log_prob
+        expand_mask = padding_mask.unsqueeze(-1).expand_as(entropy)
+        entropy = entropy.masked_fill(expand_mask, 0)
+        mean_entropy = entropy.sum() / (~padding_mask).sum()
+        return mean_entropy
+
+    def weighted_soft_cross_entropy(self, predicts, targets, weights):
+        """
+        Weighted soft cross-entropy.
+        predicts: [K, V] raw logits
+        targets:  [K, V] raw logits (will be softmaxed)
+        weights:  [K]    per-position weights (>0 for active positions)
+        """
+        active = weights > 0
+        if active.sum() == 0:
+            return 0 * predicts[0][0]
+        predict_log_prob = F.log_softmax(predicts, dim=-1)
+        targets_prob = F.softmax(targets, dim=-1)
+        per_token_loss = -(targets_prob * predict_log_prob).sum(dim=-1)  # [K]
+        weighted_loss = (per_token_loss * weights).sum() / weights.sum()
+        return weighted_loss
+
+    # FlexAttention BlockMask — v4: noisy block is bidirectional within itself
+    #
+    # Layout:  [prompt, k_0^1, ..., k_0^m, last_0, k_1^1, ..., k_1^m, last_1, ...]
+    # Each block-group j has (m + 1) slots of size N; slots 0..m-1 are noisy chains, slot m is clean.
+    #
+    # Rules:
+    #   - prompt queries:   causal within prompt
+    #   - k_j^i (noisy):    prompt + k_{j'<j}^i (SAME chain i only) + own k_j^i block (FULL, bidirectional)
+    #   - last_j (clean):   prompt + all last_{j'<j} + own last_j block (causal)
+    def _build_block_mask(self, L: int, prompt_len: int, T: int, heads: int):
+        N = self.max_new_tokens
+        m = self._get_m_noisy()
+        G = (m + 1) * N
+
+        def mask_mod(b, h, q, k):
+            rel_q = q - prompt_len
+            rel_k = k - prompt_len
+            # Block-group and slot within group (slots 0..m-1 = noisy chains, slot m = clean)
+            group_q = torch.div(rel_q, G, rounding_mode="floor")
+            group_k = torch.div(rel_k, G, rounding_mode="floor")
+            within_q = rel_q - group_q * G
+            within_k = rel_k - group_k * G
+            slot_q = torch.div(within_q, N, rounding_mode="floor")
+            slot_k = torch.div(within_k, N, rounding_mode="floor")
+
+            is_prompt_q = q < prompt_len
+            is_prompt_k = k < prompt_len
+            in_traj_q = ~is_prompt_q
+            in_traj_k = ~is_prompt_k
+
+            is_noisy_q = in_traj_q & (slot_q < m)
+            is_clean_q = in_traj_q & (slot_q == m)
+            is_noisy_k = in_traj_k & (slot_k < m)
+            is_clean_k = in_traj_k & (slot_k == m)
+
+            same_group = group_q == group_k
+            same_chain = slot_q == slot_k
+
+            # Prompt is always causal
+            mask_prompt = is_prompt_q & (k <= q)
+
+            # Noisy query k_j^i (v4):
+            #   - prompt
+            #   - previous-group SAME-CHAIN noisy  (k_{j'<j}^i)
+            #   - own block FULL  (same group, same chain) — bidirectional within block
+            noisy_prev_chain_k = is_noisy_k & same_chain & (group_k < group_q)
+            noisy_self_k = is_noisy_k & same_group & same_chain  # bidirectional within own block
+            mask_noisy = is_noisy_q & (is_prompt_k | noisy_prev_chain_k | noisy_self_k)
+
+            # Clean query last_j (unchanged semantics):
+            #   - prompt
+            #   - all previous-group clean         (last_{j'<j})
+            #   - own block causal
+            clean_prev_k = is_clean_k & (group_k < group_q)
+            clean_self_k = is_clean_k & same_group & (k <= q)
+            mask_clean = is_clean_q & (is_prompt_k | clean_prev_k | clean_self_k)
+
+            return mask_prompt | mask_noisy | mask_clean
+
+        block_mask = create_block_mask(
+            mask_mod, B=1, H=heads, Q_LEN=L, KV_LEN=L, device=self.args.device, _compile=True,
+        )
+        return block_mask
+
+    @torch.no_grad()
+    def maybe_sync_rollout_model(self):
+        if not hasattr(self, "rollout_dataset"):
+            return
+
+        ds = self.rollout_dataset
+        if ds is None or getattr(ds, "rollout_model", None) is None:
+            return
+
+        every = getattr(self.args, "rollout_sync_every", 1)
+        if self.train_step_cnt % every != 0:
+            return
+
+        train_base = self.accelerator.unwrap_model(self.model)
+        rollout_model = ds.rollout_model
+        rollout_model.eval()
+
+        # detect zero stage if available
+        zero_stage = None
+        if hasattr(self.accelerator.state, "deepspeed_plugin") and self.accelerator.state.deepspeed_plugin is not None:
+            try:
+                zero_stage = self.accelerator.state.deepspeed_plugin.zero_stage
+            except Exception:
+                zero_stage = None
+
+        # ZeRO-1 / ZeRO-2: state_dict usually works
+        if zero_stage in (None, 0, 1, 2):
+            src_sd = train_base.state_dict()
+            missing, unexpected = rollout_model.load_state_dict(src_sd, strict=False)
+            if self.accelerator.is_main_process and (missing or unexpected):
+                print(f"[sync] missing={missing[:5]} unexpected={unexpected[:5]}", flush=True)
+            rollout_model.eval()
+            return
+
+        # ZeRO-3: gather one parameter at a time
+        src_named_params = dict(train_base.named_parameters())
+        dst_named_params = dict(rollout_model.named_parameters())
+
+        # sanity check on names
+        common_param_names = [n for n in src_named_params.keys() if n in dst_named_params]
+
+        for name in common_param_names:
+            src_p = src_named_params[name]
+            dst_p = dst_named_params[name]
+
+            # Gather full parameter temporarily on each rank
+            with deepspeed.zero.GatheredParameters([src_p], modifier_rank=None):
+                if src_p.data.numel() == 0:
+                    raise RuntimeError(f"[sync] gathered param still empty: {name}, shape={tuple(src_p.shape)}")
+
+                if src_p.shape != dst_p.shape:
+                    raise RuntimeError(
+                        f"[sync] shape mismatch for {name}: "
+                        f"src={tuple(src_p.shape)} dst={tuple(dst_p.shape)}"
+                    )
+
+                dst_p.data.copy_(src_p.data.to(device=dst_p.device, dtype=dst_p.dtype))
+
+        # buffers are not partitioned the same way; just copy directly
+        src_named_bufs = dict(train_base.named_buffers())
+        dst_named_bufs = dict(rollout_model.named_buffers())
+        common_buf_names = [n for n in src_named_bufs.keys() if n in dst_named_bufs]
+
+        for name in common_buf_names:
+            src_b = src_named_bufs[name]
+            dst_b = dst_named_bufs[name]
+            if src_b.shape != dst_b.shape:
+                raise RuntimeError(
+                    f"[sync] buffer shape mismatch for {name}: "
+                    f"src={tuple(src_b.shape)} dst={tuple(dst_b.shape)}"
+                )
+            dst_b.data.copy_(src_b.data.to(device=dst_b.device, dtype=dst_b.dtype))
+
+        rollout_model.eval()
+
+    # =========================================================
+    # Validation: Jacobi tokens/iter on HumanEval
+    # =========================================================
+    @torch.no_grad()
+    def evaluate_jacobi_speed(self, max_samples: int = 0):
+        """
+        DP-style validation: each rank processes its shard of HumanEval,
+        then all-reduce to get global average tokens/iter.
+        """
+        if not hasattr(self, "val_prompt_dataset") or self.val_prompt_dataset is None:
+            return
+
+        ds = self.rollout_dataset
+        if ds is None or ds.rollout_model is None:
+            return
+
+        rollout_model = ds.rollout_model
+        rollout_model.eval()
+        device = next(rollout_model.parameters()).device
+        tokenizer = self.processing_class
+
+        from pathlib import Path
+        import sys
+        project_root = Path(__file__).resolve().parents[1]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        from modeling.cllm2_qwen2_modeling_kv_terminate_on_eos_improved_v4 import jacobi_forward_greedy
+        # Always bind v4's forward (may override a previously-bound v1/v3 version).
+        rollout_model.__class__.jacobi_forward_greedy = jacobi_forward_greedy
+
+        val_block_size = int(getattr(self.args, "val_block_size", 0) or 0)
+        n_token_seq_len = val_block_size if val_block_size > 0 else ds.cfg.n_token_seq_len
+        max_new_tokens = 1024
+        max_calls = 1024
+        eos_id = tokenizer.eos_token_id
+        alt_eos_id = ds.cfg.alt_eos_id
+
+        val_ds = self.val_prompt_dataset
+        n_total = len(val_ds)
+        if max_samples > 0:
+            n_total = min(n_total, max_samples)
+
+        # DP shard: each rank takes its slice
+        rank = max(self.args.local_rank, 0)
+        world_size = max(self.args.world_size, 1) if hasattr(self.args, "world_size") else 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        my_indices = list(range(rank, n_total, world_size))
+
+        local_tpi_sum = 0.0
+        local_tok_sum = 0.0
+        local_count = 0
+        t0 = time.perf_counter()
+
+        for i in my_indices:
+            sample = val_ds[i]
+            prompt_ids = sample["prompt_ids"].to(device).unsqueeze(0)
+            attention_mask = torch.ones_like(prompt_ids, device=device)
+            prompt_len = prompt_ids.shape[1]
+
+            generated_ids = prompt_ids.clone()
+            past_key_values = None
+            first_correct_token = None
+            prefill_phase = True
+            prefill_drafted_n_gram = None
+
+            total_new_tokens = 0
+            calls = 0
+            iters = []
+
+            while True:
+                generated_part = generated_ids[0, prompt_len:]
+                hit_eos = False
+                if eos_id is not None:
+                    hit_eos = (generated_part == eos_id).any().item()
+                if not hit_eos and alt_eos_id is not None:
+                    hit_eos = (generated_part == alt_eos_id).any().item()
+                if hit_eos:
+                    break
+                if total_new_tokens >= max_new_tokens:
+                    break
+                if calls >= max_calls:
+                    break
+
+                if prefill_phase:
+                    flat = generated_ids[0].tolist()
+                    q_sampled = [random.choice(flat) for _ in range(n_token_seq_len)]
+                    draft = torch.tensor([q_sampled], dtype=torch.long, device=device)
+                    prefill_input_ids = torch.cat((prompt_ids, draft), dim=-1)
+
+                    past_key_values, first_correct_token, prefill_drafted_n_gram, _, _ = rollout_model.jacobi_forward_greedy(
+                        input_ids=prefill_input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=None,
+                        use_cache=True,
+                        prefill_phase=True,
+                        n_token_seq_len=n_token_seq_len,
+                        tokenizer=tokenizer,
+                        eos_token_id=eos_id,
+                    )
+                    prefill_phase = False
+                    calls += 1
+                    continue
+
+                if calls == 1:
+                    step_input_ids = prefill_drafted_n_gram
+                else:
+                    flat = generated_ids[0].tolist()
+                    q_sampled = [random.choice(flat) for _ in range(n_token_seq_len - 1)]
+                    tail = torch.tensor([q_sampled], dtype=torch.long, device=device)
+                    step_input_ids = torch.cat((first_correct_token.view(1, -1), tail), dim=-1)
+
+                accepted_history_ids = generated_ids[:, prompt_len:]
+                past_key_values, first_correct_token, accepted_n_gram, itr, _ = rollout_model.jacobi_forward_greedy(
+                    input_ids=step_input_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    prefill_phase=False,
+                    n_token_seq_len=n_token_seq_len,
+                    tokenizer=tokenizer,
+                    accepted_history_ids=accepted_history_ids,
+                    eos_token_id=eos_id,
+                )
+
+                if accepted_n_gram is None or accepted_n_gram.numel() == 0:
+                    break
+
+                generated_ids = torch.cat((generated_ids, accepted_n_gram), dim=-1)
+                iters.append(itr)
+                total_new_tokens = generated_ids.shape[1] - prompt_len
+                calls += 1
+
+            total_iters = sum(iters)
+            if total_iters > 0 and total_new_tokens > 0:
+                local_tpi_sum += total_new_tokens / total_iters
+                local_tok_sum += total_new_tokens
+                local_count += 1
+
+        # All-reduce across ranks
+        stats = torch.tensor([local_tpi_sum, local_tok_sum, float(local_count)],
+                             dtype=torch.float64, device=self.args.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        global_tpi_sum, global_tok_sum, global_count = stats.tolist()
+        global_count = int(global_count)
+
+        dt = time.perf_counter() - t0
+        if global_count > 0:
+            avg_tpi = global_tpi_sum / global_count
+            avg_tokens = global_tok_sum / global_count
+        else:
+            avg_tpi = 0.0
+            avg_tokens = 0.0
+
+        if self.args.local_rank in (0, -1):
+            print(f"\n[val] step={self.train_step_cnt} | samples={global_count}/{n_total} | "
+                  f"avg tokens/iter={avg_tpi:.3f} | avg_new_tokens={avg_tokens:.1f} | "
+                  f"wall={dt:.1f}s (rank0, {len(my_indices)} local)\n", flush=True)
+
+            wandb.log({
+                "val/tokens_per_iter": avg_tpi,
+                "val/avg_new_tokens": avg_tokens,
+                "val/n_samples": global_count,
+            }, step=self.train_step_cnt)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # [B, L]
+        bsz = inputs["prompt_ids"].size(0)
+        losses = []
+        
+        for bidx in range(bsz):
+            
+            output = self.rollout_dataset._build_training_sample(inputs["prompt_ids"][bidx])
+            if output is None:
+                print(f"[dataset] skip sample idx because T=0", flush=True)
+                total_loss = torch.zeros((), device=self.args.device, requires_grad=True)
+                with self.accelerator.accumulate(model):
+                    self.accelerator.backward(total_loss)
+                losses.append(total_loss.detach())
+            else:
+                losses.append(self._one_pass_losses_step(model, output))
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        self.train_step_cnt += 1
+        
+        did_sync = False
+        if self.train_step_cnt == 1 or self.train_step_cnt % self.args.rollout_sync_every == 0:
+            self.maybe_sync_rollout_model()
+            did_sync = True
+            
+        if did_sync and torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # Periodic validation on HumanEval
+        val_every = getattr(self.args, "val_every_steps", 1000)
+        val_max_samples = getattr(self.args, "val_max_samples", 0)
+        if val_every > 0 and (self.train_step_cnt == 1 or self.train_step_cnt % val_every == 0):
+            self.evaluate_jacobi_speed(max_samples=val_max_samples)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        if output is not None and "tokens_per_iter" in output:
+            tpi_local = torch.tensor(
+                [output["tokens_per_iter"]],
+                dtype=torch.float,
+                device=self.args.device,
+            )
+        else:
+            tpi_local = torch.tensor([0.0], dtype=torch.float, device=self.args.device)
+
+        if hasattr(self, "accelerator"):
+            tpi_all = self.accelerator.gather(tpi_local)
+            tpi_mean = tpi_all.mean().item()
+        else:
+            tpi_mean = tpi_local.item()
+
+        return torch.stack(losses).mean()
+
+    def _one_pass_losses_step(self, model, inputs):
+        
+        input_ids, prompt_len, T = self._unpack_sample(inputs)
+        # for corner case of T=0, we still want to run a forward pass to avoid deadlocking on sync later
+        if T == 0:
+            outputs = model(
+                input_ids=input_ids.unsqueeze(0),
+                attention_mask=torch.ones_like(input_ids).unsqueeze(0),
+                position_ids=torch.arange(input_ids.size(0), device=input_ids.device).unsqueeze(0),
+            )
+            logits = outputs.logits
+            total_loss = logits.sum() * 0.
+            
+            torch.cuda.empty_cache()
+            
+            with self.accelerator.accumulate(model):
+                self.accelerator.backward(total_loss)
+            if self.args.local_rank == 0:
+                log_dict = {
+                    "consistency loss": 0.0,
+                    "ar loss": 0.0,
+                    "ref loss": 0.0,
+                    "total loss": 0.0,
+                }
+                if self.ref_model is not None:
+                    log_dict["ref loss"] = 0.0
+                wandb.log(log_dict)
+            return total_loss.detach()
+            
+        # print(f"train_step={self.train_step_cnt}, prompt_len={prompt_len}, num_blocks={T}", flush=True)
+        L = input_ids.size(0)
+
+        eos_id = getattr(self.processing_class, "eos_token_id")
+        pad_id = getattr(self.processing_class, "pad_token_id")
+        N = self.max_new_tokens
+
+        m = self._get_m_noisy()
+        expected_len = prompt_len + (m + 1) * T * N
+        if L != expected_len:
+            raise ValueError(
+                f"Length mismatch: L={L}, expected {expected_len} "
+                f"(prompt_len={prompt_len}, T={T}, n_token_sequence_size={N}, m_noisy={m})"
+            )
+
+        attn_mask = torch.ones(L, dtype=torch.long, device=input_ids.device)
+        k_starts, l_starts = self._index_layout(prompt_len, T, N)
+
+        # clean AR chain for potential ref usage / debugging: [prompt, last_0, last_1, ..., last_{T-1}]
+        prompt_ids_block = input_ids[:prompt_len]
+        l_blocks_concat = torch.cat([input_ids[ls:ls + N] for ls in l_starts], dim=0)
+        ar_concat_ids = torch.cat([prompt_ids_block, l_blocks_concat], dim=0)
+
+        # ===== mutate post-EOS tokens in the final last block to PAD as before =====
+        self._flip_block_after_eos_to_pad(input_ids, l_starts[-1], N, eos_id, pad_id)
+
+        # ===== block-structured student forward =====
+        num_heads = getattr(self.cfg, "num_attention_heads", 28)
+        blk_mask = self._build_block_mask(L, prompt_len, T, num_heads)
+        position_ids = self._build_shared_position_ids(L, prompt_len, T)
+
+
+        outputs = model(
+            input_ids=input_ids.unsqueeze(0),
+            attention_mask=blk_mask,
+            position_ids=position_ids.unsqueeze(0),
+            attn_implementation="flex_attention",
+        )
+        logits = outputs.logits  # [1, L, V]
+
+        # =========================================================
+        # AR loss (原来的计算部分保留)
+        # =========================================================
+        pair_logit_positions = []
+        pair_target_positions = []
+
+        def add_forward_pairs(seg_start: int, seg_end: int):
+            """
+            Add all in-block next-token pairs for a segment [seg_start, seg_end).
+            Produces pairs (p --> p+1) for p in [seg_start .. seg_end-2].
+            """
+            p = torch.arange(seg_start, seg_end - 1, device=self.args.device, dtype=torch.long)
+            t = p + 1
+            pair_logit_positions.append(p)
+            pair_target_positions.append(t)
+
+        # Prompt segment
+        end_prompt = prompt_len
+        add_forward_pairs(0, end_prompt)
+
+        # for each j, compute first-token bridge + in-block AR pairs on last_j
+        for j in range(T):
+            ls = l_starts[j]
+
+            # bridge token
+            if j == 0:
+                logit_pos = end_prompt - 1
+                target_pos = ls
+            else:
+                prev_ls = l_starts[j - 1]
+                logit_pos = prev_ls + (N - 1)
+                target_pos = ls
+
+            pair_logit_positions.append(torch.tensor([logit_pos], device=self.args.device))
+            pair_target_positions.append(torch.tensor([target_pos], device=self.args.device))
+
+            block = input_ids[ls: ls + N]
+
+            eos_pos = None
+            if eos_id is not None:
+                epos = torch.nonzero(block == eos_id, as_tuple=False)
+                eos_pos = int(epos[0]) if epos.numel() > 0 else None
+
+            end = N
+            if eos_pos is not None:
+                end = min(end, eos_pos + 1)  # include EOS in segment
+
+                # mark PAD as 0 for attn_mask
+                if pad_id is not None:
+                    mask_block = attn_mask[ls: ls + N]
+                    mask_block[block == pad_id] = 0
+                    attn_mask[ls: ls + N] = mask_block
+
+            add_forward_pairs(ls, ls + end)
+
+        # Compute CE over all AR pairs (保留原逻辑)
+        if len(pair_logit_positions) == 0:
+            loss_ar = torch.zeros((), device=self.args.device)
+        else:
+            p_all = torch.cat(pair_logit_positions, dim=0)
+            t_all = torch.cat(pair_target_positions, dim=0)
+
+            ar_logits = logits[0, p_all, :].clone()                         # [K, V]
+            ar_targets = input_ids.index_select(0, t_all).clone().detach() # [K]
+
+            # ===== DEBUG PRINTING =====
+            if self.args.local_rank == 0:
+                print(
+                    f"===== decoded last_N AR targets =====\n"
+                    f"{self.processing_class.decode(ar_targets[-64:])}\n==========\n",
+                    flush=True,
+                )
+                print(
+                    f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n",
+                    flush=True,
+                )
+            # ===== DEBUG PRINTING =====
+
+            if pad_id is not None:
+                ar_targets[ar_targets == pad_id] = -100
+
+
+            loss_ar = F.cross_entropy(
+                ar_logits.float(),
+                ar_targets,
+                reduction="mean",
+                label_smoothing=0.0,
+                ignore_index=-100,
+            ) * 10
+
+        # =========================================================
+        # Consistency loss — weighted by divergence position
+        # =========================================================
+        T_soft = getattr(self.args, "distill_temperature", 1.0)
+
+        # Weighting hyperparams (can be moved to args if needed)
+        correct_weight = getattr(self.args, "consistency_correct_weight", 0.9)
+        diverge_weight = getattr(self.args, "consistency_diverge_weight", 1.0)
+        min_weight     = getattr(self.args, "consistency_min_weight", 0.1)
+
+        offs = torch.arange(N, device=self.args.device)
+
+        # For each trajectory position j, every noisy slot k_j^i is paired with the
+        # same clean block last_j. We contribute one (student=k_j^i, teacher=last_j)
+        # soft-CE term per slot.
+        student_positions, teacher_positions, position_weights = [], [], []
+        for j in range(T):
+            ls = l_starts[j]
+            for ks in k_starts[j]:
+                w_ji = self._block_position_weights(
+                    input_ids, ks, ls, N, eos_id=eos_id,
+                    correct_weight=correct_weight,
+                    diverge_weight=diverge_weight,
+                    min_weight=min_weight,
+                )
+                active = w_ji > 0
+                if active.any():
+                    student_positions.append(ks + offs[active])
+                    teacher_positions.append(ls + offs[active])
+                    position_weights.append(w_ji[active])
+
+        if len(student_positions) == 0:
+            zero = logits.sum() * 0.0
+            loss_consistency = zero
+            loss_ref = zero
+        else:
+            sp = torch.cat(student_positions, dim=0)  # [K]
+            tp = torch.cat(teacher_positions, dim=0)  # [K]
+            pw = torch.cat(position_weights, dim=0)   # [K]
+
+            student_logits_all = logits[0, sp, :] / T_soft
+            teacher_logits_all = logits[0, tp, :].detach() / T_soft
+
+            loss_consistency = self.weighted_soft_cross_entropy(
+                student_logits_all.float(),
+                teacher_logits_all.float(),
+                pw,
+            )
+            loss_consistency = loss_consistency * (T_soft * T_soft) / T
+
+            if self.args.local_rank == 0 and self.train_step_cnt % 10 == 0:
+                with torch.no_grad():
+                    # per (block, slot) weight detail
+                    for j in range(T):
+                        ls_j = l_starts[j]
+                        l_block = input_ids[ls_j:ls_j + N]
+                        for i_slot, ks_ji in enumerate(k_starts[j]):
+                            w_ji = self._block_position_weights(
+                                input_ids, ks_ji, ls_j, N, eos_id=eos_id,
+                                correct_weight=correct_weight,
+                                diverge_weight=diverge_weight,
+                                min_weight=min_weight,
+                            )
+                            k_block = input_ids[ks_ji:ks_ji + N]
+                            diff_ji = (k_block != l_block)
+                            first_diff = "none"
+                            if diff_ji.any():
+                                first_diff = int(torch.nonzero(diff_ji, as_tuple=False)[0])
+
+                            lines = [f"  [weight] j={j} i={i_slot}  first_diff={first_diff}"]
+                            for t in range(N):
+                                tag = "C" if not diff_ji[t] else "D"  # C=correct, D=diverge
+                                k_tok = int(k_block[t])
+                                l_tok = int(l_block[t])
+                                w_val = w_ji[t].item()
+                                lines.append(
+                                    f"    off={t:2d} [{tag}] w={w_val:.3f}  "
+                                    f"k={k_tok:6d}  l={l_tok:6d}"
+                                )
+                            print("\n".join(lines), flush=True)
+
+            # =========================================================
+            # New ref loss: apply on ALL last_j positions (not just valid ones)
+            # ref_student is from block-structured clean forward, ref_teacher is from ref model on clean AR chain
+            # =========================================================
+            if self.ref_model is not None:
+                # build positions for ALL tokens in last_j blocks
+                ref_student_pos_list = []
+                ref_teacher_pos_list = []
+
+                offs_full = torch.arange(N, device=input_ids.device, dtype=torch.long)
+
+                for j in range(T):
+                    ls = l_starts[j]
+                    clean_base = prompt_len + j * N
+
+                    # student positions: all positions inside last_j in full sequence
+                    ref_student_pos_list.append(ls + offs_full)
+
+                    # teacher positions: corresponding positions inside clean AR chain
+                    ref_teacher_pos_list.append(clean_base + offs_full)
+
+                ref_student_pos = torch.cat(ref_student_pos_list, dim=0)   # [T*N]
+                ref_teacher_pos = torch.cat(ref_teacher_pos_list, dim=0)   # [T*N]
+
+                # student logits from the block-structured forward
+                ref_student_logits = logits[0, ref_student_pos, :]         # [T*N, V]
+
+                # run ref model on clean AR chain: [prompt, last_0, ..., last_{T-1}]
+                with torch.no_grad():
+                    ref_param = next(self.ref_model.parameters())
+                    ref_device = ref_param.device
+
+                    ref_input_ids = ar_concat_ids.to(ref_device).unsqueeze(0)
+                    ref_attn = torch.ones_like(ar_concat_ids, device=ref_device).unsqueeze(0)
+
+                    ref_outputs = self.ref_model(
+                        input_ids=ref_input_ids,
+                        attention_mask=ref_attn,
+                        use_cache=False,
+                    )
+                    ref_logits_full = ref_outputs.logits[0].to(input_ids.device)   # [prompt_len + T*N, V]
+
+                ref_logits_all = ref_logits_full.index_select(0, ref_teacher_pos)  # [T*N, V]
+
+                tau_ref = getattr(self.args, "ref_temperature", 1.0)
+
+                ref_targets = ref_logits_all.argmax(dim=-1)   # [T*N]
+
+                # Mask out positions at/after EOS in each last_j block
+                eos_ids = set()
+                _eos_id = getattr(self.processing_class, "eos_token_id", None)
+                if _eos_id is not None:
+                    eos_ids.add(_eos_id)
+                _im_end_id = self.processing_class.convert_tokens_to_ids('<|im_end|>')
+                if _im_end_id is not None:
+                    eos_ids.add(_im_end_id)
+                for j in range(T):
+                    ls = l_starts[j]
+                    block = input_ids[ls:ls + N]
+                    is_eos = torch.zeros(N, dtype=torch.bool, device=input_ids.device)
+                    for eid in eos_ids:
+                        is_eos |= (block == eid)
+                    eos_pos = is_eos.nonzero(as_tuple=False)
+                    if eos_pos.numel() > 0:
+                        first_eos = int(eos_pos[0])
+                        start_idx = j * N + first_eos
+                        end_idx = (j + 1) * N
+                        if start_idx < end_idx:
+                            ref_targets[start_idx:end_idx] = -100
+        
+                loss_ref = F.cross_entropy(
+                    ref_student_logits.float() / tau_ref,
+                    ref_targets,
+                    reduction="mean",
+                    ignore_index=-100,
+                )
+            else:
+                loss_ref = torch.zeros((), device=self.args.device)
+
+        # =========================================================
+        # Total loss switch
+        #   with ref_model: consistency + ref loss
+        #   without ref_model: consistency + ar loss
+        # =========================================================
+        if self.ref_model is not None:
+            ref_weight = getattr(self.args, "ref_weight", 1.0)
+            if ref_weight == 0.0:
+                print("[warning] ref_weight=0.0, consistency loss only", flush=True)
+                total_loss = loss_consistency
+            else:
+                print(f"[info] ref_weight={ref_weight}, combining consistency and ref losses", flush=True)
+                total_loss = loss_consistency + ref_weight * loss_ref
+        else:
+            print("[info] no ref model, using AR loss as auxiliary to consistency loss", flush=True)
+            total_loss = loss_consistency + loss_ar
+
+        if self.args.qlora:
+            total_loss.requires_grad = True
+
+        if self.args.local_rank == 0:
+            log_dict = {
+                "consistency loss": float(loss_consistency.detach().cpu()),
+                "ar loss": float(loss_ar.detach().cpu()),
+                "ref loss": float(loss_ref.detach().cpu()),
+                "total loss": float(total_loss.detach().cpu()),
+            }
+            if self.ref_model is not None:
+                log_dict["ref loss"] = float(loss_ref.detach().cpu())
+            wandb.log(log_dict)
+
+        torch.cuda.empty_cache()
+
+        with self.accelerator.accumulate(model):
+            self.accelerator.backward(total_loss)
+
+        return total_loss.detach()
